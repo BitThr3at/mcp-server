@@ -1,4 +1,6 @@
+
 # Burp Suite MCP Server Extension
+> ⚠️ A DNS BINDING PROTECTION REMOVED VERSION
 
 ## Overview
 
