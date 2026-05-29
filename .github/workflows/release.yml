@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag (e.g. v1.3.0). Leave blank to use version from gradle.properties."
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -32,6 +38,20 @@ jobs:
         with:
           validate-wrappers: true
 
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [ -n "${{ inputs.version }}" ]; then
+            TAG="${{ inputs.version }}"
+          else
+            VERSION="$(grep -E '^version=' gradle.properties | cut -d= -f2)"
+            TAG="v${VERSION}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Release tag: ${TAG}"
+
       - name: Run tests
         run: ./gradlew test
 
@@ -42,7 +62,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "${GITHUB_REF_NAME}" \
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --title "${{ steps.tag.outputs.tag }}" \
             --generate-notes \
+            --target "${GITHUB_SHA}" \
             build/libs/burp-mcp-*.jar
