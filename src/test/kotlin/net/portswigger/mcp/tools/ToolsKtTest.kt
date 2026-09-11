@@ -1334,12 +1334,12 @@ class ToolsKtTest {
         }
 
         @Test
-        fun `item should truncate request and response when maxLength is set`() {
+        fun `item should cap the body and keep the headers when maxLength is set`() {
             every { proxy.history() } returns listOf(
                 historyItem(
                     7,
-                    requestText = "GET /long HTTP/1.1",
-                    responseText = "HTTP/1.1 200 OK, and then a very long body"
+                    requestText = "GET /long HTTP/1.1\r\n\r\nabcdefghij",
+                    responseText = "HTTP/1.1 200 OK\r\n\r\n0123456789"
                 )
             )
 
@@ -1347,16 +1347,45 @@ class ToolsKtTest {
                 val result = client.callTool(
                     "get_proxy_http_history_item", mapOf(
                         "ids" to Json.encodeToJsonElement(listOf(7)),
-                        "maxLength" to 8
+                        "maxLength" to 4
                     )
                 )
 
                 delay(100)
                 result.expectTextContent(
-                    "[{\"id\":7,\"request\":\"GET /lon... (truncated)\"," +
-                            "\"response\":\"HTTP/1.1... (truncated)\",\"notes\":\"\"," +
-                            "\"requestBodyLength\":0,\"responseBodyLength\":0}]"
+                    "[{\"id\":7,\"request\":\"GET /long HTTP/1.1\\r\\n\\r\\nabcd... (truncated)\"," +
+                            "\"response\":\"HTTP/1.1 200 OK\\r\\n\\r\\n0123... (truncated)\",\"notes\":\"\"," +
+                            "\"requestBodyLength\":10,\"responseBodyLength\":10}]"
                 )
+            }
+        }
+
+        @Test
+        fun `item should keep a windowed body even when maxLength is smaller than the headers`() {
+            val longHeaders = "HTTP/1.1 200 OK\r\n" + (1..20).joinToString("") { "X-Filler-$it: padding value\r\n" }
+
+            every { proxy.history() } returns listOf(
+                historyItem(1, responseText = "$longHeaders\r\n0123456789abcdefghij")
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_item", mapOf(
+                        "ids" to Json.encodeToJsonElement(listOf(1)),
+                        "include" to "response",
+                        "bodyOffset" to 10,
+                        "bodyLength" to 5,
+                        "maxLength" to 20
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(
+                    text.contains("... (skipped first 10 characters of body)\\nabcde... (truncated)"),
+                    "The requested window should survive a maxLength smaller than the headers: $text"
+                )
+                assertTrue(text.contains("X-Filler-20: padding value"), "Headers should be intact: $text")
             }
         }
 

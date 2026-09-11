@@ -66,6 +66,11 @@ class SwingDataAccessApprovalHandler : DataAccessApprovalHandler {
     }
 }
 
+/**
+ * Not currently wired up: project data access is intentionally always allowed, so the tools in
+ * Tools.kt log the access and proceed rather than calling [DataAccessSecurity]. Kept so the prompt
+ * can be restored without rewriting it.
+ */
 object DataAccessSecurity {
 
     var approvalHandler: DataAccessApprovalHandler = SwingDataAccessApprovalHandler()

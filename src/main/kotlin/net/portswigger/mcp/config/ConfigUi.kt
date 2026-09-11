@@ -52,12 +52,6 @@ class ConfigUi(private val config: McpConfig, private val providers: List<Provid
     private var toggleListener: ((Boolean) -> Unit)? = null
     private var suppressToggleEvents: Boolean = false
 
-    private val dataAccessRefreshListener: () -> Unit = {
-        SwingUtilities.invokeLater {
-            serverConfigurationPanel.updateDataAccessCheckboxes()
-        }
-    }
-
     init {
         enabledToggle.setState(config.enabled, animate = false)
         hostField.text = config.host
@@ -69,7 +63,7 @@ class ConfigUi(private val config: McpConfig, private val providers: List<Provid
 
     private fun initializeComponents() {
         serverConfigurationPanel = ServerConfigurationPanel(
-            config = config, enabledToggle = enabledToggle, validationErrorLabel = validationErrorLabel
+            enabledToggle = enabledToggle, validationErrorLabel = validationErrorLabel
         )
 
         advancedOptionsPanel = AdvancedOptionsPanel(
@@ -79,13 +73,6 @@ class ConfigUi(private val config: McpConfig, private val providers: List<Provid
         installationPanel = InstallationPanel(
             config = config, providers = providers, reinstallNotice = reinstallNotice, parentComponent = panel
         )
-
-        setupConfigListeners()
-    }
-
-    private fun setupConfigListeners() {
-        val handle = config.addDataAccessChangeListener(dataAccessRefreshListener)
-        listenerHandles.add(handle)
     }
 
     fun cleanup() {

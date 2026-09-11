@@ -18,24 +18,20 @@ import net.portswigger.mcp.config.McpConfig
 import net.portswigger.mcp.schema.toItemForm
 import net.portswigger.mcp.schema.toSerializableForm
 import net.portswigger.mcp.schema.toSummaryForm
-import net.portswigger.mcp.security.DataAccessSecurity
-import net.portswigger.mcp.security.DataAccessType
 import net.portswigger.mcp.security.HttpRequestSecurity
 import net.portswigger.mcp.security.filterConfigCredentials
 import java.awt.KeyboardFocusManager
 import java.util.regex.Pattern
 import javax.swing.JTextArea
 
-private suspend fun checkDataAccessOrDeny(
-    accessType: DataAccessType, config: McpConfig, api: MontoyaApi, logMessage: String
-): Boolean {
-    val allowed = DataAccessSecurity.checkDataAccessPermission(accessType, config)
-    if (!allowed) {
-        api.logging().logToOutput("MCP $logMessage access denied")
-        return false
-    }
+/**
+ * Project data access is intentionally always allowed: the approval prompt is not wanted for this
+ * build, so tools log the access and proceed. To restore the prompt, call
+ * `DataAccessSecurity.checkDataAccessPermission` here again and deny on false, and put the data
+ * access checkboxes back in ServerConfigurationPanel.
+ */
+private fun logDataAccess(api: MontoyaApi, logMessage: String) {
     api.logging().logToOutput("MCP $logMessage access granted")
-    return true
 }
 
 private fun truncateIfNeeded(serialized: String): String = serialized.truncateTo(5000)
@@ -106,11 +102,17 @@ private fun GetProxyHttpHistorySummary.historyFilters(
 }
 
 /**
- * Narrows a raw HTTP message. Headers are always kept so that a windowed body still arrives with
- * its status line and content type; [bodyOffset] and [bodyLength] window the body only.
+ * Narrows a raw HTTP message. Headers are always kept in full so that a windowed body still arrives
+ * with its status line and content type, and so a small [maxLength] can never discard the very body
+ * the caller asked for; [bodyOffset], [bodyLength] and [maxLength] all apply to the body alone.
  */
 private fun sliceHttpMessage(
-    message: String, messageBodyOffset: Int, headersOnly: Boolean, bodyOffset: Int?, bodyLength: Int?
+    message: String,
+    messageBodyOffset: Int,
+    headersOnly: Boolean,
+    bodyOffset: Int?,
+    bodyLength: Int?,
+    maxLength: Int?
 ): String {
     val headerEnd = messageBodyOffset.coerceIn(0, message.length)
     val headers = message.substring(0, headerEnd)
@@ -119,13 +121,15 @@ private fun sliceHttpMessage(
         return headers
     }
 
-    if (bodyOffset == null && bodyLength == null) {
-        return message
-    }
-
     val body = message.substring(headerEnd)
     val from = (bodyOffset ?: 0).coerceIn(0, body.length)
-    val to = bodyLength?.let { (from + it.coerceAtLeast(0)).coerceAtMost(body.length) } ?: body.length
+
+    val windowEnd = bodyLength?.let { (from + it.coerceAtLeast(0)).coerceAtMost(body.length) } ?: body.length
+    val to = maxLength?.let { (from + it.coerceAtLeast(0)).coerceAtMost(windowEnd) } ?: windowEnd
+
+    if (from == 0 && to == body.length) {
+        return message
+    }
 
     return buildString {
         append(headers)
@@ -410,12 +414,7 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
     // Intentionally disabled: unfiltered proxy HTTP history dump (regex variant stays enabled).
     /*
     mcpPaginatedTool<GetProxyHttpHistory>("Displays items within the proxy HTTP history") {
-        val allowed = runBlocking {
-            checkDataAccessOrDeny(DataAccessType.HTTP_HISTORY, config, api, "HTTP history")
-        }
-        if (!allowed) {
-            return@mcpPaginatedTool paginationMessage("HTTP history access denied by Burp Suite")
-        }
+        logDataAccess(api, "HTTP history")
 
         paginated(api.proxy().history()) { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
     }
@@ -434,12 +433,7 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
                 "Set newestFirst to page back from the most recent request, which is usually what you want. " +
                 "Use this to survey traffic cheaply, then call get_proxy_http_history_item with the ids you care about for the full requests and responses."
     ) {
-        val allowed = runBlocking {
-            checkDataAccessOrDeny(DataAccessType.HTTP_HISTORY, config, api, "HTTP history")
-        }
-        if (!allowed) {
-            return@mcpPaginatedTool paginationMessage("HTTP history access denied by Burp Suite")
-        }
+        logDataAccess(api, "HTTP history")
 
         val searchScope = parseMessageSelection(searchIn)
             ?: return@mcpPaginatedTool paginationMessage("searchIn must be one of $MESSAGE_SELECTION_VALUES")
@@ -469,16 +463,12 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
                 "any ids that are not in the history are reported at the end. " +
                 "Proxied messages can be megabytes long, so narrow what comes back: include ('both', 'request' or " +
                 "'response') picks which messages to return, headersOnly drops the bodies, bodyOffset/bodyLength window " +
-                "the body (headers are always kept), and maxLength caps each message as a last resort. " +
+                "the body, and maxLength caps each body as a last resort. Headers are always returned in full, and " +
+                "bodyOffset, bodyLength and maxLength all apply to the body alone. " +
                 "requestBodyLength and responseBodyLength always report the full body sizes, so you can window through " +
                 "a large body across several calls."
     ) {
-        val allowed = runBlocking {
-            checkDataAccessOrDeny(DataAccessType.HTTP_HISTORY, config, api, "HTTP history")
-        }
-        if (!allowed) {
-            return@mcpTool "HTTP history access denied by Burp Suite"
-        }
+        logDataAccess(api, "HTTP history")
 
         val requestedIds = ids.distinct()
         if (requestedIds.isEmpty()) {
@@ -500,8 +490,9 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
                     messageBodyOffset = messageBodyOffset,
                     headersOnly = headersOnly == true,
                     bodyOffset = bodyOffset,
-                    bodyLength = bodyLength
-                ).truncateTo(maxLength)
+                    bodyLength = bodyLength,
+                    maxLength = maxLength
+                )
             }
         }
         val missingIds = requestedIds.filterNot { matches.containsKey(it) }
@@ -523,12 +514,7 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
     // the hit per row, with get_proxy_http_history_item for the messages themselves.
     /*
     mcpPaginatedTool<GetProxyHttpHistoryRegex>("Displays items matching a specified regex within the proxy HTTP history") {
-        val allowed = runBlocking {
-            checkDataAccessOrDeny(DataAccessType.HTTP_HISTORY, config, api, "HTTP history")
-        }
-        if (!allowed) {
-            return@mcpPaginatedTool paginationMessage("HTTP history access denied by Burp Suite")
-        }
+        logDataAccess(api, "HTTP history")
 
         val compiledRegex = Pattern.compile(regex)
         paginated(api.proxy().history { it.contains(compiledRegex) }) {
@@ -540,23 +526,13 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
     // Intentionally disabled: Organizer item retrieval.
     /*
     mcpPaginatedTool<GetOrganizerItems>("Displays items within the Organizer tab") {
-        val allowed = runBlocking {
-            checkDataAccessOrDeny(DataAccessType.ORGANIZER, config, api, "Organizer")
-        }
-        if (!allowed) {
-            return@mcpPaginatedTool paginationMessage("Organizer access denied by Burp Suite")
-        }
+        logDataAccess(api, "Organizer")
 
         paginated(api.organizer().items()) { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
     }
 
     mcpPaginatedTool<GetOrganizerItemsRegex>("Displays items matching a specified regex within the Organizer tab") {
-        val allowed = runBlocking {
-            checkDataAccessOrDeny(DataAccessType.ORGANIZER, config, api, "Organizer")
-        }
-        if (!allowed) {
-            return@mcpPaginatedTool paginationMessage("Organizer access denied by Burp Suite")
-        }
+        logDataAccess(api, "Organizer")
 
         val compiledRegex = Pattern.compile(regex)
         paginated(api.organizer().items { it.contains(compiledRegex) }) {
@@ -566,12 +542,7 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
     */
 
     mcpPaginatedTool<GetProxyWebsocketHistory>("Displays items within the proxy WebSocket history") {
-        val allowed = runBlocking {
-            checkDataAccessOrDeny(DataAccessType.WEBSOCKET_HISTORY, config, api, "WebSocket history")
-        }
-        if (!allowed) {
-            return@mcpPaginatedTool paginationMessage("WebSocket history access denied by Burp Suite")
-        }
+        logDataAccess(api, "WebSocket history")
 
         paginated(api.proxy().webSocketHistory()) {
             truncateIfNeeded(Json.encodeToString(it.toSerializableForm()))
@@ -579,12 +550,7 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
     }
 
     mcpPaginatedTool<GetProxyWebsocketHistoryRegex>("Displays items matching a specified regex within the proxy WebSocket history") {
-        val allowed = runBlocking {
-            checkDataAccessOrDeny(DataAccessType.WEBSOCKET_HISTORY, config, api, "WebSocket history")
-        }
-        if (!allowed) {
-            return@mcpPaginatedTool paginationMessage("WebSocket history access denied by Burp Suite")
-        }
+        logDataAccess(api, "WebSocket history")
 
         val compiledRegex = Pattern.compile(regex)
         paginated(api.proxy().webSocketHistory { it.contains(compiledRegex) }) {

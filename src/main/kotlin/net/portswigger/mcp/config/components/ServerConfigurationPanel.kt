@@ -1,22 +1,16 @@
 package net.portswigger.mcp.config.components
 
 import net.portswigger.mcp.config.Design
-import net.portswigger.mcp.config.McpConfig
 import net.portswigger.mcp.config.ToggleSwitch
 import java.awt.FlowLayout
-import java.awt.event.ItemEvent
 import javax.swing.*
 import javax.swing.Box.createHorizontalStrut
 import javax.swing.Box.createVerticalStrut
 
 class ServerConfigurationPanel(
-    private val config: McpConfig,
     private val enabledToggle: ToggleSwitch,
     private val validationErrorLabel: WarningLabel
 ) : JPanel() {
-
-    private lateinit var alwaysAllowHttpHistoryCheckBox: JCheckBox
-    private lateinit var alwaysAllowWebSocketHistoryCheckBox: JCheckBox
 
     init {
         layout = BoxLayout(this, BoxLayout.Y_AXIS)
@@ -47,30 +41,13 @@ class ServerConfigurationPanel(
         add(enabledPanel)
         add(createVerticalStrut(Design.Spacing.MD))
 
-        // Controls for intentionally disabled tools are not shown: "Enable tools that can edit your
-        // config" (set_project_options / set_user_options), "Require approval for HTTP requests"
-        // (send_http1_request / send_http2_request), "Always allow Organizer access"
-        // (get_organizer_items) and "Filter config credentials" (output_project_options /
-        // output_user_options). The settings themselves are still persisted, so re-enabling a tool
-        // only means restoring its checkbox here.
-
-        val dataAccessApprovalCheckBox = createDataAccessApprovalCheckBox()
-        add(dataAccessApprovalCheckBox)
-        add(createVerticalStrut(Design.Spacing.SM))
-
-        alwaysAllowHttpHistoryCheckBox = createIndentedCheckBox(
-            "Always allow HTTP history access", config.alwaysAllowHttpHistory, config.requireDataAccessApproval
-        ) { config.alwaysAllowHttpHistory = it }
-        add(alwaysAllowHttpHistoryCheckBox)
-        add(createVerticalStrut(Design.Spacing.SM))
-
-        alwaysAllowWebSocketHistoryCheckBox = createIndentedCheckBox(
-            "Always allow WebSocket history access",
-            config.alwaysAllowWebSocketHistory,
-            config.requireDataAccessApproval
-        ) { config.alwaysAllowWebSocketHistory = it }
-        add(alwaysAllowWebSocketHistoryCheckBox)
-        add(createVerticalStrut(Design.Spacing.MD))
+        // No approval controls are shown. Project data access (proxy and WebSocket history) is always
+        // allowed, and the controls for intentionally disabled tools would govern nothing: "Enable
+        // tools that can edit your config" (set_project_options / set_user_options), "Require approval
+        // for HTTP requests" (send_http1_request / send_http2_request), "Always allow Organizer
+        // access" (get_organizer_items) and "Filter config credentials" (output_project_options /
+        // output_user_options). Every setting is still persisted, so restoring a control here is all
+        // that is needed to bring its gate back.
 
         add(validationErrorLabel)
     }
@@ -87,94 +64,6 @@ class ServerConfigurationPanel(
         enabledPanel.add(createHorizontalStrut(Design.Spacing.MD))
         enabledPanel.add(enabledToggle)
         return enabledPanel
-    }
-
-    private fun createDataAccessApprovalCheckBox(): JCheckBox {
-        return createStandardCheckBox(
-            "Require approval for project data access", config.requireDataAccessApproval
-        ) { enabled ->
-            config.requireDataAccessApproval = enabled
-            if (!enabled) {
-                config.alwaysAllowHttpHistory = false
-                config.alwaysAllowWebSocketHistory = false
-                config.alwaysAllowOrganizer = false
-                alwaysAllowHttpHistoryCheckBox.isSelected = false
-                alwaysAllowWebSocketHistoryCheckBox.isSelected = false
-            }
-            alwaysAllowHttpHistoryCheckBox.isEnabled = enabled
-            alwaysAllowWebSocketHistoryCheckBox.isEnabled = enabled
-        }
-    }
-
-    fun updateDataAccessCheckboxes() {
-        SwingUtilities.invokeLater {
-            alwaysAllowHttpHistoryCheckBox.isSelected = config.alwaysAllowHttpHistory
-            alwaysAllowWebSocketHistoryCheckBox.isSelected = config.alwaysAllowWebSocketHistory
-        }
-    }
-
-    private fun createStandardCheckBox(
-        text: String, initialValue: Boolean, onChange: (Boolean) -> Unit
-    ): JCheckBox {
-        return JCheckBox(text).apply {
-            alignmentX = LEFT_ALIGNMENT
-            isSelected = initialValue
-            font = Design.Typography.bodyLarge
-            foreground = Design.Colors.onSurface
-            addItemListener { event ->
-                onChange(event.stateChange == ItemEvent.SELECTED)
-            }
-        }
-    }
-
-    private fun createIndentedCheckBox(
-        text: String, initialValue: Boolean, enabled: Boolean, onChange: (Boolean) -> Unit
-    ): JCheckBox {
-        return JCheckBox(text).apply {
-            alignmentX = LEFT_ALIGNMENT
-            isSelected = initialValue
-            isEnabled = enabled
-            font = Design.Typography.bodyMedium
-            foreground = Design.Colors.onSurfaceVariant
-            border = BorderFactory.createEmptyBorder(0, Design.Spacing.LG, 0, 0)
-            addItemListener { event ->
-                onChange(event.stateChange == ItemEvent.SELECTED)
-            }
-        }
-    }
-
-    private fun createCheckBoxWithSubtitle(
-        mainText: String, subtitleText: String, initialValue: Boolean, onChange: (Boolean) -> Unit
-    ): JPanel {
-        val checkBox = JCheckBox(mainText).apply {
-            alignmentX = LEFT_ALIGNMENT
-            isSelected = initialValue
-            font = Design.Typography.bodyLarge
-            foreground = Design.Colors.onSurface
-            addItemListener { event ->
-                onChange(event.stateChange == ItemEvent.SELECTED)
-            }
-        }
-
-        val subtitleLabel = JLabel(subtitleText).apply {
-            font = Design.Typography.labelMedium
-            foreground = Design.Colors.onSurfaceVariant
-        }
-
-        val subtitlePanel = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
-            isOpaque = false
-            alignmentX = LEFT_ALIGNMENT
-            add(createHorizontalStrut(20))
-            add(subtitleLabel)
-        }
-
-        return JPanel().apply {
-            layout = BoxLayout(this, BoxLayout.Y_AXIS)
-            alignmentX = LEFT_ALIGNMENT
-            isOpaque = false
-            add(checkBox)
-            add(subtitlePanel)
-        }
     }
 
 }
