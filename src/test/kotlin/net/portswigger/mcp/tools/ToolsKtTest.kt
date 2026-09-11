@@ -9,10 +9,12 @@ import burp.api.montoya.http.Http
 import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.HttpProtocol
 import burp.api.montoya.http.message.HttpHeader
+import burp.api.montoya.http.message.MimeType
 import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.logging.Logging
 import burp.api.montoya.persistence.PersistedObject
 import burp.api.montoya.proxy.Proxy
+import burp.api.montoya.proxy.ProxyHistoryFilter
 import burp.api.montoya.proxy.ProxyHttpRequestResponse
 import burp.api.montoya.utilities.Base64Utils
 import burp.api.montoya.utilities.RandomUtils
@@ -37,9 +39,11 @@ import net.portswigger.mcp.schema.toSerializableForm
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Disabled
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import java.net.ServerSocket
+import java.util.regex.Pattern
 import javax.swing.JTextArea
 
 class ToolsKtTest {
@@ -159,6 +163,7 @@ class ToolsKtTest {
     }
 
     @Nested
+    @Disabled("Tools intentionally disabled: send_http1_request, send_http2_request, create_repeater_tab_http2")
     inner class HttpToolsTests {
         @Test
         fun `http1 line endings should be normalized`() {
@@ -399,6 +404,7 @@ class ToolsKtTest {
     }
 
     @Nested
+    @Disabled("Tools intentionally disabled: url_encode, url_decode, base64_encode, base64_decode, generate_random_string")
     inner class UtilityToolsTests {
         @Test
         fun `url encode should work properly`() {
@@ -520,6 +526,7 @@ class ToolsKtTest {
     }
     
     @Nested
+    @Disabled("Tools intentionally disabled: set_task_execution_engine_state, set_proxy_intercept_state, set_project_options")
     inner class ConfigurationToolsTests {
         @Test
         fun `set task execution engine state should work properly`() {
@@ -638,6 +645,740 @@ class ToolsKtTest {
     }
 
     @Nested
+    inner class ProxyHistorySummaryTests {
+        private val proxy = mockk<Proxy>()
+
+        @BeforeEach
+        fun setupProxy() {
+            unmockkStatic("net.portswigger.mcp.schema.SerializationKt")
+            every { api.proxy() } returns proxy
+        }
+
+        private fun bodyOffsetOf(message: String): Int {
+            val blankLine = message.indexOf("\r\n\r\n")
+            return if (blankLine < 0) message.length else blankLine + 4
+        }
+
+        private fun historyItem(
+            id: Int,
+            method: String = "POST",
+            path: String = "/PaymentProcessing.aspx",
+            host: String = "www.travelboutiqueonline.com",
+            port: Int = 443,
+            secure: Boolean = true,
+            hasParams: Boolean = true,
+            edited: Boolean = false,
+            statusCode: Short? = 200,
+            responseLength: Int = 870,
+            mimeType: MimeType = MimeType.HTML,
+            requestText: String = "$method $path HTTP/1.1\r\nHost: $host\r\n\r\n",
+            responseText: String = "HTTP/1.1 200 OK\r\n\r\nbody",
+            notes: String = ""
+        ): ProxyHttpRequestResponse {
+            val scheme = if (secure) "https" else "http"
+
+            val request = mockk<HttpRequest>().also {
+                every { it.hasParameters() } returns hasParams
+                every { it.toString() } returns requestText
+                every { it.bodyOffset() } returns bodyOffsetOf(requestText)
+                every { it.method() } returns method
+                every { it.path() } returns path
+                every { it.url() } returns "$scheme://$host$path"
+            }
+
+            val response = statusCode?.let { code ->
+                mockk<burp.api.montoya.http.message.responses.HttpResponse>().also {
+                    every { it.statusCode() } returns code
+                    every { it.toByteArray() } returns mockk<ByteArray>().also { bytes ->
+                        every { bytes.length() } returns responseLength
+                    }
+                    every { it.toString() } returns responseText
+                    every { it.bodyOffset() } returns bodyOffsetOf(responseText)
+                }
+            }
+
+            val httpService = mockk<burp.api.montoya.http.HttpService>().also {
+                every { it.host() } returns host
+                every { it.port() } returns port
+                every { it.secure() } returns secure
+            }
+
+            return mockk<ProxyHttpRequestResponse>().also {
+                every { it.id() } returns id
+                every { it.httpService() } returns httpService
+                every { it.edited() } returns edited
+                every { it.mimeType() } returns mimeType
+                every { it.hasResponse() } returns (statusCode != null)
+                every { it.request() } returns request
+                every { it.response() } returns response
+                every { it.contains(any<Pattern>()) } answers {
+                    firstArg<Pattern>().matcher(requestText + responseText).find()
+                }
+                every { it.annotations() } returns mockk<burp.api.montoya.core.Annotations>().also { annotations ->
+                    every { annotations.notes() } returns notes
+                }
+            }
+        }
+
+        /** Applies the tool's own [ProxyHistoryFilter] the way Burp would, so filters are really exercised. */
+        private fun filterableHistory(items: List<ProxyHttpRequestResponse>) {
+            every { proxy.history(any()) } answers {
+                val filter = firstArg<ProxyHistoryFilter>()
+                items.filter { filter.matches(it) }
+            }
+        }
+
+        private fun summaryIds(text: String): List<Int> =
+            Regex("\"id\":(\\d+)").findAll(text).map { it.groupValues[1].toInt() }.toList()
+
+        @Test
+        fun `summary should report burp history columns`() {
+            every { proxy.history() } returns listOf(historyItem(54160))
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertEquals(
+                    "{\"id\":54160,\"host\":\"https://www.travelboutiqueonline.com\",\"method\":\"POST\"," +
+                            "\"url\":\"/PaymentProcessing.aspx\",\"params\":true,\"edited\":false," +
+                            "\"statusCode\":200,\"length\":870}\n\n" +
+                            "-- showing 1-1 of 1 (oldest first), no more items --",
+                    text
+                )
+            }
+        }
+
+        @Test
+        fun `summary should omit status code and length when there is no response`() {
+            every { proxy.history() } returns listOf(historyItem(1, statusCode = null))
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"statusCode\":null"), "Expected null status code in: $text")
+                assertTrue(text.contains("\"length\":null"), "Expected null length in: $text")
+            }
+        }
+
+        @Test
+        fun `summary should include the port for non-default ports`() {
+            every { proxy.history() } returns listOf(historyItem(1, secure = false, port = 8080))
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(
+                    text.contains("\"host\":\"http://www.travelboutiqueonline.com:8080\""),
+                    "Expected scheme and port in: $text"
+                )
+            }
+        }
+
+        @Test
+        fun `summary should page from the newest item and report totals`() {
+            every { proxy.history() } returns (1..5).map { historyItem(it, path = "/item$it") }
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "count" to 2,
+                        "offset" to 0,
+                        "newestFirst" to true
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertEquals(listOf(5, 4), summaryIds(text))
+                assertTrue(
+                    text.endsWith("-- showing 1-2 of 5 (newest first), nextOffset=2 --"),
+                    "Expected a pagination footer in: $text"
+                )
+            }
+        }
+
+        @Test
+        fun `summary should report the total when the offset is past the end`() {
+            every { proxy.history() } returns listOf(historyItem(1), historyItem(2))
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "count" to 2,
+                        "offset" to 5
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent("Reached end of items (2 total)")
+            }
+        }
+
+        @Test
+        fun `summary should reject a non-positive count`() {
+            every { proxy.history() } returns listOf(historyItem(1))
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "count" to 0,
+                        "offset" to 0
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent("count must be greater than 0")
+            }
+        }
+
+        @Test
+        fun `summary should filter on host method status code and mime type`() {
+            filterableHistory(
+                listOf(
+                    historyItem(1, host = "api.example.com", method = "GET", statusCode = 200, mimeType = MimeType.JSON),
+                    historyItem(2, host = "api.example.com", method = "POST", statusCode = 500, mimeType = MimeType.JSON),
+                    historyItem(3, host = "www.example.com", method = "GET", statusCode = 200, mimeType = MimeType.HTML)
+                )
+            )
+
+            runBlocking {
+                val byHost = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "host" to "API.example",
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+                delay(100)
+                assertEquals(listOf(1, 2), summaryIds(byHost.expectTextContent()))
+
+                val byMethodAndStatus = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "method" to "get",
+                        "statusCode" to 200,
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+                delay(100)
+                assertEquals(listOf(1, 3), summaryIds(byMethodAndStatus.expectTextContent()))
+
+                val byMimeType = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "mimeType" to "json",
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+                delay(100)
+                assertEquals(listOf(1, 2), summaryIds(byMimeType.expectTextContent()))
+            }
+
+            verify(exactly = 0) { proxy.history() }
+        }
+
+        @Test
+        fun `summary should filter on url substring id range and missing responses`() {
+            filterableHistory(
+                listOf(
+                    historyItem(10, path = "/PaymentProcessing.aspx"),
+                    historyItem(20, path = "/AjaxHandler.aspx"),
+                    historyItem(30, path = "/PaymentHistory.aspx", statusCode = null)
+                )
+            )
+
+            runBlocking {
+                val byUrl = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "urlContains" to "payment",
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+                delay(100)
+                assertEquals(listOf(10, 30), summaryIds(byUrl.expectTextContent()))
+
+                val byIdRange = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "fromId" to 20,
+                        "toId" to 29,
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+                delay(100)
+                assertEquals(listOf(20), summaryIds(byIdRange.expectTextContent()))
+
+                val withoutResponse = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "hasResponse" to false,
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+                delay(100)
+                assertEquals(listOf(30), summaryIds(withoutResponse.expectTextContent()))
+            }
+        }
+
+        @Test
+        fun `summary should filter on burp target scope`() {
+            val scope = mockk<burp.api.montoya.scope.Scope>()
+            every { api.scope() } returns scope
+            every { scope.isInScope(any()) } answers { firstArg<String>().contains("in-scope") }
+
+            filterableHistory(
+                listOf(
+                    historyItem(1, host = "in-scope.example.com"), historyItem(2, host = "other.example.com")
+                )
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "inScopeOnly" to true,
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+
+                delay(100)
+                assertEquals(listOf(1), summaryIds(result.expectTextContent()))
+            }
+        }
+
+        @Test
+        fun `summary regex should search request and response bodies`() {
+            filterableHistory(
+                listOf(
+                    historyItem(
+                        1,
+                        requestText = "POST /login HTTP/1.1\r\nHost: h\r\n\r\nuser=admin&token=SECRET-A",
+                        responseText = "HTTP/1.1 200 OK\r\n\r\n{\"ok\":true}"
+                    ),
+                    historyItem(
+                        2,
+                        requestText = "GET /profile HTTP/1.1\r\nHost: h\r\n\r\n",
+                        responseText = "HTTP/1.1 200 OK\r\n\r\n{\"session\":\"SECRET-B\"}"
+                    ),
+                    historyItem(
+                        3,
+                        requestText = "GET /health HTTP/1.1\r\nHost: h\r\n\r\n",
+                        responseText = "HTTP/1.1 200 OK\r\n\r\nfine"
+                    )
+                )
+            )
+
+            runBlocking {
+                val bothBodies = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "regex" to "SECRET-\\w",
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+                delay(100)
+                val bothText = bothBodies.expectTextContent()
+                assertEquals(listOf(1, 2), summaryIds(bothText))
+                assertTrue(bothText.contains("\"matchedIn\":[\"request\"],\"match\":\"SECRET-A\""), bothText)
+                assertTrue(bothText.contains("\"matchedIn\":[\"response\"],\"match\":\"SECRET-B\""), bothText)
+
+                val responsesOnly = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "regex" to "SECRET-\\w",
+                        "searchIn" to "response",
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+                delay(100)
+                assertEquals(listOf(2), summaryIds(responsesOnly.expectTextContent()))
+
+                val requestsOnly = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "regex" to "SECRET-\\w",
+                        "searchIn" to "request",
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+                delay(100)
+                assertEquals(listOf(1), summaryIds(requestsOnly.expectTextContent()))
+            }
+        }
+
+        @Test
+        fun `summary regex should report a hit in both messages`() {
+            filterableHistory(
+                listOf(
+                    historyItem(
+                        1,
+                        requestText = "GET /x HTTP/1.1\r\n\r\nneedle",
+                        responseText = "HTTP/1.1 200 OK\r\n\r\nneedle"
+                    )
+                )
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "regex" to "needle",
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+
+                delay(100)
+                assertTrue(
+                    result.expectTextContent().contains("\"matchedIn\":[\"request\",\"response\"]"),
+                    "Expected both messages to be reported"
+                )
+            }
+        }
+
+        @Test
+        fun `summary should omit match details when no regex is given`() {
+            every { proxy.history() } returns listOf(historyItem(1))
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertFalse(text.contains("matchedIn"), "matchedIn should be absent: $text")
+                assertFalse(text.contains("\"match\""), "match should be absent: $text")
+            }
+        }
+
+        @Test
+        fun `summary should reject an unknown searchIn value`() {
+            every { proxy.history() } returns listOf(historyItem(1))
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "regex" to "x",
+                        "searchIn" to "headers",
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent("searchIn must be one of 'both', 'request' or 'response'")
+            }
+        }
+
+        @Test
+        fun `summary should filter by regex and paginate`() {
+            filterableHistory(
+                listOf(
+                    historyItem(1, path = "/one"), historyItem(2, path = "/two"), historyItem(3, path = "/three")
+                )
+            )
+
+            runBlocking {
+                val page1 = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "regex" to "HTTP/1\\.1",
+                        "count" to 2,
+                        "offset" to 0
+                    )
+                )
+
+                delay(100)
+                val text1 = page1.expectTextContent()
+                assertTrue(text1.contains("\"url\":\"/one\""))
+                assertTrue(text1.contains("\"url\":\"/two\""))
+                assertFalse(text1.contains("\"url\":\"/three\""))
+
+                val page2 = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "regex" to "HTTP/1\\.1",
+                        "count" to 2,
+                        "offset" to 2
+                    )
+                )
+
+                delay(100)
+                assertTrue(page2.expectTextContent().contains("\"url\":\"/three\""))
+            }
+
+            verify(exactly = 0) { proxy.history() }
+        }
+
+        @Test
+        fun `item should return the full request and response for an id`() {
+            every { proxy.history() } returns listOf(
+                historyItem(54018, path = "/other"),
+                historyItem(
+                    54019,
+                    requestText = "POST /PaymentProcessing.aspx HTTP/1.1",
+                    responseText = "HTTP/1.1 200 OK",
+                    notes = "interesting"
+                )
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_item", mapOf(
+                        "ids" to Json.encodeToJsonElement(listOf(54019))
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent(
+                    "[{\"id\":54019,\"request\":\"POST /PaymentProcessing.aspx HTTP/1.1\"," +
+                            "\"response\":\"HTTP/1.1 200 OK\",\"notes\":\"interesting\"," +
+                            "\"requestBodyLength\":0,\"responseBodyLength\":0}]"
+                )
+            }
+        }
+
+        @Test
+        fun `item should return only the requested message`() {
+            every { proxy.history() } returns listOf(
+                historyItem(1, requestText = "GET /x HTTP/1.1\r\n\r\nreq", responseText = "HTTP/1.1 200 OK\r\n\r\nresp")
+            )
+
+            runBlocking {
+                val onlyResponse = client.callTool(
+                    "get_proxy_http_history_item", mapOf(
+                        "ids" to Json.encodeToJsonElement(listOf(1)),
+                        "include" to "response"
+                    )
+                )
+                delay(100)
+                val responseText = onlyResponse.expectTextContent()
+                assertFalse(responseText.contains("\"request\""), "Request should be omitted: $responseText")
+                assertTrue(responseText.contains("\"response\":\"HTTP/1.1 200 OK\\r\\n\\r\\nresp\""))
+
+                val onlyRequest = client.callTool(
+                    "get_proxy_http_history_item", mapOf(
+                        "ids" to Json.encodeToJsonElement(listOf(1)),
+                        "include" to "request"
+                    )
+                )
+                delay(100)
+                val requestText = onlyRequest.expectTextContent()
+                assertFalse(requestText.contains("\"response\""), "Response should be omitted: $requestText")
+                assertTrue(requestText.contains("\"request\":\"GET /x HTTP/1.1\\r\\n\\r\\nreq\""))
+            }
+        }
+
+        @Test
+        fun `item should reject an unknown include value`() {
+            every { proxy.history() } returns listOf(historyItem(1))
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_item", mapOf(
+                        "ids" to Json.encodeToJsonElement(listOf(1)),
+                        "include" to "headers"
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent("include must be one of 'both', 'request' or 'response'")
+            }
+        }
+
+        @Test
+        fun `item should drop bodies when headersOnly is set`() {
+            every { proxy.history() } returns listOf(
+                historyItem(
+                    1,
+                    requestText = "GET /x HTTP/1.1\r\nHost: h\r\n\r\nrequest body",
+                    responseText = "HTTP/1.1 200 OK\r\nServer: s\r\n\r\nresponse body"
+                )
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_item", mapOf(
+                        "ids" to Json.encodeToJsonElement(listOf(1)),
+                        "headersOnly" to true
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent(
+                    "[{\"id\":1,\"request\":\"GET /x HTTP/1.1\\r\\nHost: h\\r\\n\\r\\n\"," +
+                            "\"response\":\"HTTP/1.1 200 OK\\r\\nServer: s\\r\\n\\r\\n\",\"notes\":\"\"," +
+                            "\"requestBodyLength\":12,\"responseBodyLength\":13}]"
+                )
+            }
+        }
+
+        @Test
+        fun `item should window the body and keep the headers`() {
+            every { proxy.history() } returns listOf(
+                historyItem(
+                    1,
+                    requestText = "GET /x HTTP/1.1\r\n\r\nabcdefghij",
+                    responseText = "HTTP/1.1 200 OK\r\n\r\n0123456789"
+                )
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_item", mapOf(
+                        "ids" to Json.encodeToJsonElement(listOf(1)),
+                        "include" to "response",
+                        "bodyOffset" to 4,
+                        "bodyLength" to 3
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(
+                    text.contains(
+                        "\"response\":\"HTTP/1.1 200 OK\\r\\n\\r\\n... (skipped first 4 characters of body)\\n456... (truncated)\""
+                    ),
+                    "Expected a windowed body in: $text"
+                )
+                assertTrue(text.contains("\"responseBodyLength\":10"), "Full body length should be reported: $text")
+            }
+        }
+
+        @Test
+        fun `item should return several ids in the order requested`() {
+            every { proxy.history() } returns listOf(
+                historyItem(1, requestText = "GET /one HTTP/1.1", responseText = "HTTP/1.1 200 one"),
+                historyItem(2, requestText = "GET /two HTTP/1.1", responseText = "HTTP/1.1 200 two"),
+                historyItem(3, requestText = "GET /three HTTP/1.1", responseText = "HTTP/1.1 200 three")
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_item", mapOf(
+                        "ids" to Json.encodeToJsonElement(listOf(3, 1, 3))
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertEquals(
+                    "[{\"id\":3,\"request\":\"GET /three HTTP/1.1\",\"response\":\"HTTP/1.1 200 three\",\"notes\":\"\"," +
+                            "\"requestBodyLength\":0,\"responseBodyLength\":0}," +
+                            "{\"id\":1,\"request\":\"GET /one HTTP/1.1\",\"response\":\"HTTP/1.1 200 one\",\"notes\":\"\"," +
+                            "\"requestBodyLength\":0,\"responseBodyLength\":0}]",
+                    text
+                )
+            }
+        }
+
+        @Test
+        fun `item should report ids that are missing alongside the ones found`() {
+            every { proxy.history() } returns listOf(
+                historyItem(1, requestText = "GET /one HTTP/1.1", responseText = "HTTP/1.1 200 one")
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_item", mapOf(
+                        "ids" to Json.encodeToJsonElement(listOf(1, 42, 43))
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent(
+                    "[{\"id\":1,\"request\":\"GET /one HTTP/1.1\",\"response\":\"HTTP/1.1 200 one\",\"notes\":\"\"," +
+                            "\"requestBodyLength\":0,\"responseBodyLength\":0}]\n" +
+                            "No proxy HTTP history items with ids: 42, 43"
+                )
+            }
+        }
+
+        @Test
+        fun `item should reject an empty id list`() {
+            every { proxy.history() } returns listOf(historyItem(1))
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_item", mapOf(
+                        "ids" to Json.encodeToJsonElement(emptyList<Int>())
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent("No ids requested")
+            }
+        }
+
+        @Test
+        fun `item should truncate request and response when maxLength is set`() {
+            every { proxy.history() } returns listOf(
+                historyItem(
+                    7,
+                    requestText = "GET /long HTTP/1.1",
+                    responseText = "HTTP/1.1 200 OK, and then a very long body"
+                )
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_item", mapOf(
+                        "ids" to Json.encodeToJsonElement(listOf(7)),
+                        "maxLength" to 8
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent(
+                    "[{\"id\":7,\"request\":\"GET /lon... (truncated)\"," +
+                            "\"response\":\"HTTP/1.1... (truncated)\",\"notes\":\"\"," +
+                            "\"requestBodyLength\":0,\"responseBodyLength\":0}]"
+                )
+            }
+        }
+
+        @Test
+        fun `item should report an unknown id`() {
+            every { proxy.history() } returns listOf(historyItem(1))
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_item", mapOf(
+                        "ids" to Json.encodeToJsonElement(listOf(999))
+                    )
+                )
+
+                delay(100)
+                result.expectTextContent("No proxy HTTP history items with ids: 999")
+            }
+        }
+    }
+
+    @Nested
+    @Disabled("Tools intentionally disabled: get_active_editor_contents, set_active_editor_contents")
     inner class EditorTests {
         @Test
         fun `get active editor contents should handle no editor`() {
@@ -731,75 +1472,7 @@ class ToolsKtTest {
         }
     }
     
-    @Nested
-    inner class PaginatedToolsTests {
-        @Test
-        fun `get proxy history should paginate properly`() {
-            val proxy = mockk<Proxy>()
-            val proxyHistory = listOf(
-                mockk<ProxyHttpRequestResponse>(),
-                mockk<ProxyHttpRequestResponse>(),
-                mockk<ProxyHttpRequestResponse>()
-            )
-            
-            every { api.proxy() } returns proxy
-            every { proxy.history() } returns proxyHistory
-            
-            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
-            
-            every { proxyHistory[0].toSerializableForm() } returns HttpRequestResponse(
-                request = "GET /item1 HTTP/1.1",
-                response = "HTTP/1.1 200 OK",
-                notes = "Item 1 notes"
-            )
-            every { proxyHistory[1].toSerializableForm() } returns HttpRequestResponse(
-                request = "GET /item2 HTTP/1.1",
-                response = "HTTP/1.1 200 OK",
-                notes = "Item 2 notes"
-            )
-            every { proxyHistory[2].toSerializableForm() } returns HttpRequestResponse(
-                request = "GET /item3 HTTP/1.1",
-                response = "HTTP/1.1 200 OK",
-                notes = "Item 3 notes"
-            )
-            
-            runBlocking {
-                val result1 = client.callTool(
-                    "get_proxy_http_history", mapOf(
-                        "count" to 2,
-                        "offset" to 0
-                    )
-                )
-                
-                delay(100)
-                val text1 = result1.expectTextContent()
-                assertTrue(text1.contains("GET /item1"))
-                assertTrue(text1.contains("GET /item2"))
-                assertFalse(text1.contains("GET /item3"))
-                
-                val result2 = client.callTool(
-                    "get_proxy_http_history", mapOf(
-                        "count" to 2,
-                        "offset" to 2
-                    )
-                )
-                
-                delay(100)
-                val text2 = result2.expectTextContent()
-                assertTrue(text2.contains("GET /item3"))
-                
-                val result3 = client.callTool(
-                    "get_proxy_http_history", mapOf(
-                        "count" to 2,
-                        "offset" to 3
-                    )
-                )
-                
-                delay(100)
-                assertEquals("Reached end of items", result3.expectTextContent())
-            }
-        }
-    }
+    // Pagination itself is covered by ProxyHistorySummaryTests, against the tools that are enabled.
     
     @Nested
     inner class CollaboratorToolsTests {
@@ -1027,6 +1700,48 @@ class ToolsKtTest {
     }
 
     @Test
+    fun `intentionally disabled tools should not be registered`() {
+        val disabledTools = listOf(
+            "send_http1_request",
+            "send_http2_request",
+            "create_repeater_tab",
+            "create_repeater_tab_http2",
+            "send_to_intruder",
+            "url_encode",
+            "url_decode",
+            "base64_encode",
+            "base64_decode",
+            "generate_random_string",
+            "output_project_options",
+            "output_user_options",
+            "set_project_options",
+            "set_user_options",
+            "get_scanner_issues",
+            "get_proxy_http_history",
+            "get_proxy_http_history_regex",
+            "get_organizer_items",
+            "get_organizer_items_regex",
+            "set_task_execution_engine_state",
+            "set_proxy_intercept_state",
+            "get_active_editor_contents",
+            "set_active_editor_contents"
+        )
+
+        runBlocking {
+            val toolNames = client.listTools().map { it.name }
+
+            disabledTools.forEach { tool ->
+                assertFalse(toolNames.contains(tool), "$tool is intentionally disabled and should not be registered")
+            }
+
+            assertTrue(toolNames.contains("get_proxy_http_history_summary"))
+            assertTrue(toolNames.contains("get_proxy_http_history_item"))
+            assertTrue(toolNames.contains("get_proxy_websocket_history"))
+            assertTrue(toolNames.contains("get_proxy_websocket_history_regex"))
+        }
+    }
+
+    @Test
     fun `tool name conversion should work properly`() {
         assertEquals("send_http1_request", "SendHttp1Request".toLowerSnakeCase())
         assertEquals("test_case_conversion", "TestCaseConversion".toLowerSnakeCase())
@@ -1044,7 +1759,6 @@ class ToolsKtTest {
         every { version.edition() } returns BurpSuiteEdition.COMMUNITY_EDITION
         runBlocking {
             val tools = client.listTools()
-            assertFalse(tools.any { it.name == "get_scanner_issues" })
             assertFalse(tools.any { it.name == "generate_collaborator_payload" })
             assertFalse(tools.any { it.name == "get_collaborator_interactions" })
         }
@@ -1068,9 +1782,10 @@ class ToolsKtTest {
             client.connectToServer("http://127.0.0.1:${testPort}")
 
             val tools = client.listTools()
-            assertTrue(tools.any { it.name == "get_scanner_issues" })
             assertTrue(tools.any { it.name == "generate_collaborator_payload" })
             assertTrue(tools.any { it.name == "get_collaborator_interactions" })
+            // get_scanner_issues is intentionally disabled, so it never registers in any edition
+            assertFalse(tools.any { it.name == "get_scanner_issues" })
         }
     }
 }

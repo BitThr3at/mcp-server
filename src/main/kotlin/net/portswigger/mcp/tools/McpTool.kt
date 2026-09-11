@@ -11,6 +11,13 @@ import kotlinx.serialization.serializer
 import net.portswigger.mcp.schema.asInputSchema
 import kotlin.experimental.ExperimentalTypeInference
 
+/**
+ * MCP clients routinely pass along parameters a tool doesn't declare; drop them rather than
+ * failing the whole call.
+ */
+@PublishedApi
+internal val toolInputJson: Json = Json { ignoreUnknownKeys = true }
+
 @OptIn(InternalSerializationApi::class)
 inline fun <reified I : Any> Server.mcpTool(
     description: String,
@@ -26,7 +33,7 @@ inline fun <reified I : Any> Server.mcpTool(
             try {
                 CallToolResult(
                     content = execute(
-                        Json.decodeFromJsonElement(
+                        toolInputJson.decodeFromJsonElement(
                             I::class.serializer(),
                             request.arguments
                         )
@@ -68,42 +75,63 @@ inline fun <reified I : Any> Server.mcpTool(
     })
 }
 
-inline fun <reified I : Paginated, J : Any> Server.mcpPaginatedTool(
-    description: String,
-    noinline mapper: (J) -> CharSequence = { it.toString() },
-    crossinline execute: I.() -> List<J>
-) {
-    mcpTool<I>(description, execute = {
+/**
+ * What a paginated tool hands back: either the full result set to page over, or a message
+ * that replaces the page (an access denial, for instance).
+ *
+ * Items are only rendered once the requested window has been sliced, so tools can return the
+ * whole underlying collection without paying to serialize all of it.
+ */
+class PaginatedContent(
+    val total: Int,
+    val slice: (from: Int, to: Int, newestFirst: Boolean) -> List<String>,
+    val message: String?
+)
 
-        val items = execute(this)
+fun <T> paginated(items: List<T>, render: (T) -> String): PaginatedContent = PaginatedContent(
+    total = items.size,
+    slice = { from, to, newestFirst ->
+        val ordered = if (newestFirst) items.asReversed() else items
+        ordered.subList(from, to).map(render)
+    },
+    message = null
+)
 
-        when {
-            offset >= items.size -> {
-                "Reached end of items"
-            }
+fun paginationMessage(text: String): PaginatedContent =
+    PaginatedContent(total = 0, slice = { _, _, _ -> emptyList() }, message = text)
 
-            else -> {
-                val upperLimit = (offset + count).coerceAtMost(items.size)
+@PublishedApi
+internal fun paginationFooter(from: Int, to: Int, total: Int, newestFirst: Boolean): String {
+    val order = if (newestFirst) "newest first" else "oldest first"
+    val more = if (to < total) "nextOffset=$to" else "no more items"
 
-                items.subList(offset, upperLimit)
-                    .joinToString(separator = "\n\n", transform = mapper)
-            }
-        }
-    })
+    return "-- showing ${from + 1}-$to of $total ($order), $more --"
 }
 
 inline fun <reified I : Paginated> Server.mcpPaginatedTool(
     description: String,
-    crossinline execute: I.() -> Sequence<String>
+    crossinline execute: I.() -> PaginatedContent
 ) {
     mcpTool<I>(description, execute = {
-        val seq = execute(this)
-        val paginated = seq.drop(offset).take(count).toList()
+        val content = execute(this)
 
-        if (paginated.isEmpty()) {
-            listOf(TextContent("Reached end of items"))
-        } else {
-            listOf(TextContent(paginated.joinToString(separator = "\n\n")))
+        when {
+            content.message != null -> content.message!!
+
+            count <= 0 -> "count must be greater than 0"
+
+            offset < 0 -> "offset cannot be negative"
+
+            offset >= content.total -> "Reached end of items (${content.total} total)"
+
+            else -> {
+                val to = (offset + count).coerceAtMost(content.total)
+                val orderNewestFirst = newestFirst == true
+                val rendered = content.slice(offset, to, orderNewestFirst)
+
+                rendered.joinToString(separator = "\n\n") +
+                        "\n\n" + paginationFooter(offset, to, content.total, orderNewestFirst)
+            }
         }
     })
 }
@@ -156,5 +184,11 @@ fun String.toLowerSnakeCase(): String {
 interface Paginated {
     val count: Int
     val offset: Int
+
+    /**
+     * Burp hands back history oldest-first, but the interesting traffic is usually the most
+     * recent. Setting this pages backwards from the newest item instead.
+     */
+    val newestFirst: Boolean? get() = null
 }
 

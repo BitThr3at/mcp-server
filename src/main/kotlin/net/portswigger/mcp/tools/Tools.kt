@@ -9,12 +9,15 @@ import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.http.message.HttpHeader
 import burp.api.montoya.http.message.requests.HttpRequest
+import burp.api.montoya.proxy.ProxyHttpRequestResponse
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import net.portswigger.mcp.config.McpConfig
+import net.portswigger.mcp.schema.toItemForm
 import net.portswigger.mcp.schema.toSerializableForm
+import net.portswigger.mcp.schema.toSummaryForm
 import net.portswigger.mcp.security.DataAccessSecurity
 import net.portswigger.mcp.security.DataAccessType
 import net.portswigger.mcp.security.HttpRequestSecurity
@@ -35,11 +38,104 @@ private suspend fun checkDataAccessOrDeny(
     return true
 }
 
-private fun truncateIfNeeded(serialized: String): String {
-    return if (serialized.length > 5000) {
-        serialized.substring(0, 5000) + "... (truncated)"
-    } else {
-        serialized
+private fun truncateIfNeeded(serialized: String): String = serialized.truncateTo(5000)
+
+private fun String.truncateTo(maxLength: Int?): String {
+    val limit = (maxLength ?: return this).coerceAtLeast(0)
+
+    return if (length > limit) substring(0, limit) + "... (truncated)" else this
+}
+
+private class MessageSelection(val request: Boolean, val response: Boolean)
+
+private const val MESSAGE_SELECTION_VALUES = "'both', 'request' or 'response'"
+
+private fun parseMessageSelection(value: String?): MessageSelection? = when (value?.lowercase()) {
+    null, "both" -> MessageSelection(request = true, response = true)
+    "request" -> MessageSelection(request = true, response = false)
+    "response" -> MessageSelection(request = false, response = true)
+    else -> null
+}
+
+/**
+ * Searches the raw messages rather than Burp's own `contains` so that request and response bodies
+ * are definitely covered, and reports which messages hit plus the first matching text.
+ */
+private fun ProxyHttpRequestResponse.regexSearch(pattern: Pattern, scope: MessageSelection): RegexSearchResult? {
+    val searched = buildList {
+        if (scope.request) request()?.let { add("request" to it.toString()) }
+        if (scope.response && hasResponse()) response()?.let { add("response" to it.toString()) }
+    }
+
+    val hits = searched.mapNotNull { (name, message) ->
+        val matcher = pattern.matcher(message)
+        if (matcher.find()) name to matcher.group() else null
+    }
+
+    return if (hits.isEmpty()) null else RegexSearchResult(
+        matchedIn = hits.map { it.first }, match = hits.first().second.truncateTo(MATCH_SNIPPET_LENGTH)
+    )
+}
+
+private const val MATCH_SNIPPET_LENGTH = 200
+
+private class RegexSearchResult(val matchedIn: List<String>, val match: String)
+
+/**
+ * Burp's own filtering runs inside Burp, so the predicates are handed to
+ * `Proxy.history(ProxyHistoryFilter)` rather than applied to a fully materialized history.
+ *
+ * Cheap metadata checks come first so that the regex, which has to pull whole messages, only runs
+ * on the items everything else already accepted.
+ */
+private fun GetProxyHttpHistorySummary.historyFilters(
+    api: MontoyaApi, compiledRegex: Pattern?, searchScope: MessageSelection
+): List<(ProxyHttpRequestResponse) -> Boolean> = buildList {
+    host?.let { value -> add { it.httpService().host().contains(value, ignoreCase = true) } }
+    urlContains?.let { value -> add { it.request()?.path()?.contains(value, ignoreCase = true) == true } }
+    method?.let { value -> add { it.request()?.method().equals(value, ignoreCase = true) } }
+    mimeType?.let { value -> add { it.mimeType().name.equals(value, ignoreCase = true) } }
+    statusCode?.let { value -> add { it.hasResponse() && it.response().statusCode().toInt() == value } }
+    hasResponse?.let { value -> add { it.hasResponse() == value } }
+    fromId?.let { value -> add { it.id() >= value } }
+    toId?.let { value -> add { it.id() <= value } }
+    if (inScopeOnly == true) {
+        add { request -> request.request()?.url()?.let { api.scope().isInScope(it) } == true }
+    }
+    compiledRegex?.let { pattern -> add { it.regexSearch(pattern, searchScope) != null } }
+}
+
+/**
+ * Narrows a raw HTTP message. Headers are always kept so that a windowed body still arrives with
+ * its status line and content type; [bodyOffset] and [bodyLength] window the body only.
+ */
+private fun sliceHttpMessage(
+    message: String, messageBodyOffset: Int, headersOnly: Boolean, bodyOffset: Int?, bodyLength: Int?
+): String {
+    val headerEnd = messageBodyOffset.coerceIn(0, message.length)
+    val headers = message.substring(0, headerEnd)
+
+    if (headersOnly) {
+        return headers
+    }
+
+    if (bodyOffset == null && bodyLength == null) {
+        return message
+    }
+
+    val body = message.substring(headerEnd)
+    val from = (bodyOffset ?: 0).coerceIn(0, body.length)
+    val to = bodyLength?.let { (from + it.coerceAtLeast(0)).coerceAtMost(body.length) } ?: body.length
+
+    return buildString {
+        append(headers)
+        if (from > 0) {
+            append("... (skipped first $from characters of body)\n")
+        }
+        append(body, from, to)
+        if (to < body.length) {
+            append("... (truncated)")
+        }
     }
 }
 
@@ -117,6 +213,9 @@ private fun normalizePrelude(prelude: String): String = prelude
 
 fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
 
+    // Intentionally disabled: HTTP sending, Repeater/Intruder handoff, encoding/decoding
+    // utilities, random string generation, and project/user options read+write.
+    /*
     mcpTool<SendHttp1Request>("Issues an HTTP/1.1 request and returns the response.") {
         val allowed = runBlocking {
             HttpRequestSecurity.checkHttpRequestPermission(targetHostname, targetPort, config, content, api)
@@ -256,11 +355,15 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
             toolingDisabledMessage
         }
     }
+    */
 
     if (api.burpSuite().version().edition() == BurpSuiteEdition.PROFESSIONAL) {
+        // Intentionally disabled: scanner issue retrieval.
+        /*
         mcpPaginatedTool<GetScannerIssues>("Displays information about issues identified by the scanner") {
-            api.siteMap().issues().asSequence().map { Json.encodeToString(it.toSerializableForm()) }
+            paginated(api.siteMap().issues()) { Json.encodeToString(it.toSerializableForm()) }
         }
+        */
 
         val collaboratorClient by lazy { api.collaborator().createClient() }
 
@@ -304,39 +407,147 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         }
     }
 
+    // Intentionally disabled: unfiltered proxy HTTP history dump (regex variant stays enabled).
+    /*
     mcpPaginatedTool<GetProxyHttpHistory>("Displays items within the proxy HTTP history") {
         val allowed = runBlocking {
             checkDataAccessOrDeny(DataAccessType.HTTP_HISTORY, config, api, "HTTP history")
         }
         if (!allowed) {
-            return@mcpPaginatedTool sequenceOf("HTTP history access denied by Burp Suite")
+            return@mcpPaginatedTool paginationMessage("HTTP history access denied by Burp Suite")
         }
 
-        api.proxy().history().asSequence().map { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+        paginated(api.proxy().history()) { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+    }
+    */
+
+    mcpPaginatedTool<GetProxyHttpHistorySummary>(
+        "Searches and summarises the proxy HTTP history, one line per item, mirroring the columns of Burp's HTTP " +
+                "history table: id (the '#' column), host, method, url, params, edited, statusCode and length. " +
+                "Pass a regex to search the whole history: it is matched against the complete raw messages, headers " +
+                "and bodies included, and searchIn ('both', 'request' or 'response') narrows which messages are " +
+                "searched. Matching rows also report matchedIn and the first matching text. " +
+                "Every filter is optional and they combine: host and urlContains (case-insensitive substrings), " +
+                "method, statusCode, mimeType (Burp's type name, e.g. JSON or HTML), hasResponse, inScopeOnly (uses " +
+                "Burp's target scope), and the fromId/toId id range. Narrowing with these makes a regex search much " +
+                "cheaper, since the regex only runs on what they accept. " +
+                "Set newestFirst to page back from the most recent request, which is usually what you want. " +
+                "Use this to survey traffic cheaply, then call get_proxy_http_history_item with the ids you care about for the full requests and responses."
+    ) {
+        val allowed = runBlocking {
+            checkDataAccessOrDeny(DataAccessType.HTTP_HISTORY, config, api, "HTTP history")
+        }
+        if (!allowed) {
+            return@mcpPaginatedTool paginationMessage("HTTP history access denied by Burp Suite")
+        }
+
+        val searchScope = parseMessageSelection(searchIn)
+            ?: return@mcpPaginatedTool paginationMessage("searchIn must be one of $MESSAGE_SELECTION_VALUES")
+
+        val compiledRegex = regex?.let { Pattern.compile(it) }
+        val filters = historyFilters(api, compiledRegex, searchScope)
+
+        val history = if (filters.isEmpty()) {
+            api.proxy().history()
+        } else {
+            api.proxy().history { item -> filters.all { it(item) } }
+        }
+
+        paginated(history) { item ->
+            val search = compiledRegex?.let { item.regexSearch(it, searchScope) }
+
+            Json.encodeToString(
+                item.toSummaryForm().copy(matchedIn = search?.matchedIn, match = search?.match)
+            )
+        }
     }
 
+    mcpTool<GetProxyHttpHistoryItem>(
+        "Returns the request and response of one or more proxy HTTP history items, identified by the ids shown in " +
+                "the '#' column of Burp's HTTP history (see get_proxy_http_history_summary). " +
+                "Pass a single id as a one-element array; results come back as a JSON array in the order requested, and " +
+                "any ids that are not in the history are reported at the end. " +
+                "Proxied messages can be megabytes long, so narrow what comes back: include ('both', 'request' or " +
+                "'response') picks which messages to return, headersOnly drops the bodies, bodyOffset/bodyLength window " +
+                "the body (headers are always kept), and maxLength caps each message as a last resort. " +
+                "requestBodyLength and responseBodyLength always report the full body sizes, so you can window through " +
+                "a large body across several calls."
+    ) {
+        val allowed = runBlocking {
+            checkDataAccessOrDeny(DataAccessType.HTTP_HISTORY, config, api, "HTTP history")
+        }
+        if (!allowed) {
+            return@mcpTool "HTTP history access denied by Burp Suite"
+        }
+
+        val requestedIds = ids.distinct()
+        if (requestedIds.isEmpty()) {
+            return@mcpTool "No ids requested"
+        }
+
+        val messages = parseMessageSelection(include)
+            ?: return@mcpTool "include must be one of $MESSAGE_SELECTION_VALUES"
+
+        val wantedIds = requestedIds.toSet()
+        val matches = api.proxy().history().filter { it.id() in wantedIds }.associateBy { it.id() }
+
+        val items = requestedIds.mapNotNull { matches[it] }.map { item ->
+            item.toItemForm(
+                includeRequest = messages.request, includeResponse = messages.response
+            ) { message, messageBodyOffset ->
+                sliceHttpMessage(
+                    message = message,
+                    messageBodyOffset = messageBodyOffset,
+                    headersOnly = headersOnly == true,
+                    bodyOffset = bodyOffset,
+                    bodyLength = bodyLength
+                ).truncateTo(maxLength)
+            }
+        }
+        val missingIds = requestedIds.filterNot { matches.containsKey(it) }
+
+        buildString {
+            if (items.isNotEmpty()) {
+                append(Json.encodeToString(items))
+            }
+            if (missingIds.isNotEmpty()) {
+                if (isNotEmpty()) appendLine()
+                append("No proxy HTTP history items with ids: ${missingIds.joinToString(", ")}")
+            }
+        }
+    }
+
+    // Intentionally disabled: regex search over the proxy HTTP history. It returned every matching
+    // request and response in full, which is enormously expensive and never showed what matched;
+    // get_proxy_http_history_summary now takes the same regex, searches bodies as well, and reports
+    // the hit per row, with get_proxy_http_history_item for the messages themselves.
+    /*
     mcpPaginatedTool<GetProxyHttpHistoryRegex>("Displays items matching a specified regex within the proxy HTTP history") {
         val allowed = runBlocking {
             checkDataAccessOrDeny(DataAccessType.HTTP_HISTORY, config, api, "HTTP history")
         }
         if (!allowed) {
-            return@mcpPaginatedTool sequenceOf("HTTP history access denied by Burp Suite")
+            return@mcpPaginatedTool paginationMessage("HTTP history access denied by Burp Suite")
         }
 
         val compiledRegex = Pattern.compile(regex)
-        api.proxy().history { it.contains(compiledRegex) }.asSequence()
-            .map { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+        paginated(api.proxy().history { it.contains(compiledRegex) }) {
+            truncateIfNeeded(Json.encodeToString(it.toSerializableForm()))
+        }
     }
+    */
 
+    // Intentionally disabled: Organizer item retrieval.
+    /*
     mcpPaginatedTool<GetOrganizerItems>("Displays items within the Organizer tab") {
         val allowed = runBlocking {
             checkDataAccessOrDeny(DataAccessType.ORGANIZER, config, api, "Organizer")
         }
         if (!allowed) {
-            return@mcpPaginatedTool sequenceOf("Organizer access denied by Burp Suite")
+            return@mcpPaginatedTool paginationMessage("Organizer access denied by Burp Suite")
         }
 
-        api.organizer().items().asSequence().map { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+        paginated(api.organizer().items()) { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
     }
 
     mcpPaginatedTool<GetOrganizerItemsRegex>("Displays items matching a specified regex within the Organizer tab") {
@@ -344,24 +555,27 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
             checkDataAccessOrDeny(DataAccessType.ORGANIZER, config, api, "Organizer")
         }
         if (!allowed) {
-            return@mcpPaginatedTool sequenceOf("Organizer access denied by Burp Suite")
+            return@mcpPaginatedTool paginationMessage("Organizer access denied by Burp Suite")
         }
 
         val compiledRegex = Pattern.compile(regex)
-        api.organizer().items { it.contains(compiledRegex) }.asSequence()
-            .map { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+        paginated(api.organizer().items { it.contains(compiledRegex) }) {
+            truncateIfNeeded(Json.encodeToString(it.toSerializableForm()))
+        }
     }
+    */
 
     mcpPaginatedTool<GetProxyWebsocketHistory>("Displays items within the proxy WebSocket history") {
         val allowed = runBlocking {
             checkDataAccessOrDeny(DataAccessType.WEBSOCKET_HISTORY, config, api, "WebSocket history")
         }
         if (!allowed) {
-            return@mcpPaginatedTool sequenceOf("WebSocket history access denied by Burp Suite")
+            return@mcpPaginatedTool paginationMessage("WebSocket history access denied by Burp Suite")
         }
 
-        api.proxy().webSocketHistory().asSequence()
-            .map { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+        paginated(api.proxy().webSocketHistory()) {
+            truncateIfNeeded(Json.encodeToString(it.toSerializableForm()))
+        }
     }
 
     mcpPaginatedTool<GetProxyWebsocketHistoryRegex>("Displays items matching a specified regex within the proxy WebSocket history") {
@@ -369,14 +583,18 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
             checkDataAccessOrDeny(DataAccessType.WEBSOCKET_HISTORY, config, api, "WebSocket history")
         }
         if (!allowed) {
-            return@mcpPaginatedTool sequenceOf("WebSocket history access denied by Burp Suite")
+            return@mcpPaginatedTool paginationMessage("WebSocket history access denied by Burp Suite")
         }
 
         val compiledRegex = Pattern.compile(regex)
-        api.proxy().webSocketHistory { it.contains(compiledRegex) }.asSequence()
-            .map { truncateIfNeeded(Json.encodeToString(it.toSerializableForm())) }
+        paginated(api.proxy().webSocketHistory { it.contains(compiledRegex) }) {
+            truncateIfNeeded(Json.encodeToString(it.toSerializableForm()))
+        }
     }
 
+    // Intentionally disabled: task execution engine control, proxy intercept toggle, and
+    // active editor read/write.
+    /*
     mcpTool<SetTaskExecutionEngineState>("Sets the state of Burp's task execution engine (paused or unpaused)") {
         api.burpSuite().taskExecutionEngine().state = if (running) RUNNING else PAUSED
 
@@ -408,6 +626,7 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
 
         "Editor text has been set"
     }
+    */
 }
 
 fun getActiveEditor(api: MontoyaApi): JTextArea? {
@@ -511,26 +730,76 @@ data class SetProxyInterceptState(val intercepting: Boolean)
 data class SetActiveEditorContents(val text: String)
 
 @Serializable
-data class GetScannerIssues(override val count: Int, override val offset: Int) : Paginated
+data class GetScannerIssues(
+    override val count: Int, override val offset: Int, override val newestFirst: Boolean? = null
+) : Paginated
 
 @Serializable
-data class GetProxyHttpHistory(override val count: Int, override val offset: Int) : Paginated
+data class GetProxyHttpHistory(
+    override val count: Int, override val offset: Int, override val newestFirst: Boolean? = null
+) : Paginated
 
 @Serializable
-data class GetProxyHttpHistoryRegex(val regex: String, override val count: Int, override val offset: Int) : Paginated
+data class GetProxyHttpHistoryRegex(
+    val regex: String,
+    override val count: Int,
+    override val offset: Int,
+    override val newestFirst: Boolean? = null
+) : Paginated
 
 @Serializable
-data class GetOrganizerItems(override val count: Int, override val offset: Int) : Paginated
+data class GetProxyHttpHistorySummary(
+    val regex: String? = null,
+    val searchIn: String? = null,
+    val host: String? = null,
+    val urlContains: String? = null,
+    val method: String? = null,
+    val mimeType: String? = null,
+    val statusCode: Int? = null,
+    val hasResponse: Boolean? = null,
+    val inScopeOnly: Boolean? = null,
+    val fromId: Int? = null,
+    val toId: Int? = null,
+    override val count: Int,
+    override val offset: Int,
+    override val newestFirst: Boolean? = null
+) : Paginated
 
 @Serializable
-data class GetOrganizerItemsRegex(val regex: String, override val count: Int, override val offset: Int) : Paginated
+data class GetProxyHttpHistoryItem(
+    val ids: List<Int>,
+    val include: String? = null,
+    val headersOnly: Boolean? = null,
+    val bodyOffset: Int? = null,
+    val bodyLength: Int? = null,
+    val maxLength: Int? = null
+)
 
 @Serializable
-data class GetProxyWebsocketHistory(override val count: Int, override val offset: Int) : Paginated
+data class GetOrganizerItems(
+    override val count: Int, override val offset: Int, override val newestFirst: Boolean? = null
+) : Paginated
 
 @Serializable
-data class GetProxyWebsocketHistoryRegex(val regex: String, override val count: Int, override val offset: Int) :
-    Paginated
+data class GetOrganizerItemsRegex(
+    val regex: String,
+    override val count: Int,
+    override val offset: Int,
+    override val newestFirst: Boolean? = null
+) : Paginated
+
+@Serializable
+data class GetProxyWebsocketHistory(
+    override val count: Int, override val offset: Int, override val newestFirst: Boolean? = null
+) : Paginated
+
+@Serializable
+data class GetProxyWebsocketHistoryRegex(
+    val regex: String,
+    override val count: Int,
+    override val offset: Int,
+    override val newestFirst: Boolean? = null
+) : Paginated
 
 @Serializable
 data class GenerateCollaboratorPayload(

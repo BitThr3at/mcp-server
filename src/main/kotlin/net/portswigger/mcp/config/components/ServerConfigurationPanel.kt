@@ -17,7 +17,6 @@ class ServerConfigurationPanel(
 
     private lateinit var alwaysAllowHttpHistoryCheckBox: JCheckBox
     private lateinit var alwaysAllowWebSocketHistoryCheckBox: JCheckBox
-    private lateinit var alwaysAllowOrganizerCheckBox: JCheckBox
 
     init {
         layout = BoxLayout(this, BoxLayout.Y_AXIS)
@@ -48,19 +47,12 @@ class ServerConfigurationPanel(
         add(enabledPanel)
         add(createVerticalStrut(Design.Spacing.MD))
 
-        val configEditingToolingCheckBox = createCheckBoxWithSubtitle(
-            "Enable tools that can edit your config",
-            "WARNING: Can execute code",
-            config.configEditingTooling
-        ) { config.configEditingTooling = it }
-        add(configEditingToolingCheckBox)
-        add(createVerticalStrut(Design.Spacing.MD))
-
-        val httpRequestApprovalCheckBox = createStandardCheckBox(
-            "Require approval for HTTP requests", config.requireHttpRequestApproval
-        ) { config.requireHttpRequestApproval = it }
-        add(httpRequestApprovalCheckBox)
-        add(createVerticalStrut(Design.Spacing.MD))
+        // Controls for intentionally disabled tools are not shown: "Enable tools that can edit your
+        // config" (set_project_options / set_user_options), "Require approval for HTTP requests"
+        // (send_http1_request / send_http2_request), "Always allow Organizer access"
+        // (get_organizer_items) and "Filter config credentials" (output_project_options /
+        // output_user_options). The settings themselves are still persisted, so re-enabling a tool
+        // only means restoring its checkbox here.
 
         val dataAccessApprovalCheckBox = createDataAccessApprovalCheckBox()
         add(dataAccessApprovalCheckBox)
@@ -78,22 +70,7 @@ class ServerConfigurationPanel(
             config.requireDataAccessApproval
         ) { config.alwaysAllowWebSocketHistory = it }
         add(alwaysAllowWebSocketHistoryCheckBox)
-        add(createVerticalStrut(Design.Spacing.SM))
-
-        alwaysAllowOrganizerCheckBox = createIndentedCheckBox(
-            "Always allow Organizer access",
-            config.alwaysAllowOrganizer,
-            config.requireDataAccessApproval
-        ) { config.alwaysAllowOrganizer = it }
-        add(alwaysAllowOrganizerCheckBox)
         add(createVerticalStrut(Design.Spacing.MD))
-
-        val filterConfigCredentialsCheckBox = createCheckBoxWithSubtitle(
-            "Filter config credentials",
-            "Hides sensitive data in config files (Platform Authentication, socks proxy, etc.)",
-            config.filterConfigCredentials
-        ) { config.filterConfigCredentials = it }
-        add(filterConfigCredentialsCheckBox)
 
         add(validationErrorLabel)
     }
@@ -123,11 +100,9 @@ class ServerConfigurationPanel(
                 config.alwaysAllowOrganizer = false
                 alwaysAllowHttpHistoryCheckBox.isSelected = false
                 alwaysAllowWebSocketHistoryCheckBox.isSelected = false
-                alwaysAllowOrganizerCheckBox.isSelected = false
             }
             alwaysAllowHttpHistoryCheckBox.isEnabled = enabled
             alwaysAllowWebSocketHistoryCheckBox.isEnabled = enabled
-            alwaysAllowOrganizerCheckBox.isEnabled = enabled
         }
     }
 
@@ -135,7 +110,6 @@ class ServerConfigurationPanel(
         SwingUtilities.invokeLater {
             alwaysAllowHttpHistoryCheckBox.isSelected = config.alwaysAllowHttpHistory
             alwaysAllowWebSocketHistoryCheckBox.isSelected = config.alwaysAllowWebSocketHistory
-            alwaysAllowOrganizerCheckBox.isSelected = config.alwaysAllowOrganizer
         }
     }
 

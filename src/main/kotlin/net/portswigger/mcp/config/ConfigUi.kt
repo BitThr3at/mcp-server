@@ -47,7 +47,6 @@ class ConfigUi(private val config: McpConfig, private val providers: List<Provid
 
     private lateinit var serverConfigurationPanel: ServerConfigurationPanel
     private lateinit var advancedOptionsPanel: AdvancedOptionsPanel
-    private lateinit var autoApproveTargetsPanel: AutoApproveTargetsPanel
     private lateinit var installationPanel: InstallationPanel
 
     private var toggleListener: ((Boolean) -> Unit)? = null
@@ -77,8 +76,6 @@ class ConfigUi(private val config: McpConfig, private val providers: List<Provid
             hostField = hostField, portField = portField, reinstallNotice = reinstallNotice
         )
 
-        autoApproveTargetsPanel = AutoApproveTargetsPanel(config = config)
-
         installationPanel = InstallationPanel(
             config = config, providers = providers, reinstallNotice = reinstallNotice, parentComponent = panel
         )
@@ -94,10 +91,6 @@ class ConfigUi(private val config: McpConfig, private val providers: List<Provid
     fun cleanup() {
         listenerHandles.forEach { it.remove() }
         listenerHandles.clear()
-
-        if (::autoApproveTargetsPanel.isInitialized) {
-            autoApproveTargetsPanel.cleanup()
-        }
     }
 
     fun onEnabledToggled(listener: (Boolean) -> Unit) {
@@ -198,7 +191,8 @@ class ConfigUi(private val config: McpConfig, private val providers: List<Provid
         rightPanelContent.add(serverConfigurationPanel)
         rightPanelContent.add(createVerticalStrut(Design.Spacing.LG))
 
-        rightPanelContent.add(autoApproveTargetsPanel)
+        // The auto-approve targets list only governs send_http1_request / send_http2_request, which
+        // are intentionally disabled, so it is not shown. Restore it alongside those tools.
 
         rightPanelContent.add(createVerticalStrut(15))
         rightPanelContent.add(advancedOptionsPanel)

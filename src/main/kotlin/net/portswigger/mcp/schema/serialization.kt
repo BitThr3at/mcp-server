@@ -53,6 +53,72 @@ fun ProxyHttpRequestResponse.toSerializableForm(): HttpRequestResponse {
     )
 }
 
+/**
+ * Compact form of a proxy history row, mirroring the columns shown in Burp's
+ * Proxy > HTTP history table: #, Host, URL, Method, Params, Edited, Status code, Length.
+ *
+ * `length` is the size of the full response in bytes, matching Burp's Length column.
+ */
+fun ProxyHttpRequestResponse.toSummaryForm(): HttpHistorySummary {
+    val request = request()
+    val response = if (hasResponse()) response() else null
+
+    return HttpHistorySummary(
+        id = id(),
+        host = originString(),
+        method = request?.method() ?: "",
+        url = request?.path() ?: "",
+        params = request?.hasParameters() ?: false,
+        edited = edited(),
+        statusCode = response?.statusCode()?.toInt(),
+        length = response?.toByteArray()?.length()
+    )
+}
+
+/**
+ * Full form of a proxy history row, keyed by the id from Burp's '#' column so that several
+ * items can be returned together and still be correlated with a history summary.
+ *
+ * Messages are rendered through [slice], which decides how much of each message to keep;
+ * body lengths are always reported in full so a caller can window through a large body.
+ */
+fun ProxyHttpRequestResponse.toItemForm(
+    includeRequest: Boolean = true,
+    includeResponse: Boolean = true,
+    slice: (message: String, bodyOffset: Int) -> String = { message, _ -> message }
+): ProxyHistoryItem {
+    val request = request()
+    val response = if (hasResponse()) response() else null
+
+    return ProxyHistoryItem(
+        id = id(),
+        request = when {
+            !includeRequest -> null
+            request == null -> "<no request>"
+            else -> slice(request.toString(), request.bodyOffset())
+        },
+        response = when {
+            !includeResponse -> null
+            response == null -> "<no response>"
+            else -> slice(response.toString(), response.bodyOffset())
+        },
+        notes = annotations().notes(),
+        requestBodyLength = request?.let { it.toString().length - it.bodyOffset() },
+        responseBodyLength = response?.let { it.toString().length - it.bodyOffset() }
+    )
+}
+
+private fun ProxyHttpRequestResponse.originString(): String {
+    val service = httpService()
+    val secure = service.secure()
+    val port = service.port()
+
+    val scheme = if (secure) "https" else "http"
+    val isDefaultPort = (secure && port == 443) || (!secure && port == 80)
+
+    return if (isDefaultPort) "$scheme://${service.host()}" else "$scheme://${service.host()}:$port"
+}
+
 fun OrganizerItem.toSerializableForm(): OrganizerItemDetails {
     return OrganizerItemDetails(
         id = id(),
@@ -117,6 +183,31 @@ data class HttpRequestResponse(
     val request: String?,
     val response: String?,
     val notes: String?
+)
+
+@Serializable
+data class ProxyHistoryItem(
+    val id: Int,
+    val request: String? = null,
+    val response: String? = null,
+    val notes: String? = null,
+    val requestBodyLength: Int? = null,
+    val responseBodyLength: Int? = null
+)
+
+@Serializable
+data class HttpHistorySummary(
+    val id: Int,
+    val host: String,
+    val method: String,
+    val url: String,
+    val params: Boolean,
+    val edited: Boolean,
+    val statusCode: Int?,
+    val length: Int?,
+    /** Which messages a regex search hit, and the first matching text; only set for regex searches. */
+    val matchedIn: List<String>? = null,
+    val match: String? = null
 )
 
 @Serializable
