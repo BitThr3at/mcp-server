@@ -1764,6 +1764,7 @@ class ToolsKtTest {
             }
 
             assertTrue(toolNames.contains("get_proxy_http_history_summary"))
+            assertTrue(toolNames.contains("get_proxy_http_history_bambda"))
             assertTrue(toolNames.contains("get_proxy_http_history_item"))
             assertTrue(toolNames.contains("get_proxy_websocket_history"))
             assertTrue(toolNames.contains("get_proxy_websocket_history_regex"))

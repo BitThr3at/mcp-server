@@ -78,27 +78,89 @@ private const val MATCH_SNIPPET_LENGTH = 200
 private class RegexSearchResult(val matchedIn: List<String>, val match: String)
 
 /**
+ * Examples adapted from github.com/PortSwigger/bambdas (Filter/Proxy/HTTP), covering the API shapes an
+ * MCP client is most likely to need. `requestResponse`/`utilities`/`logging` work either as bare
+ * identifiers or as `utilities()`/`logging()` calls — see [BambdaCompiler].
+ */
+private val BAMBDA_TOOL_DESCRIPTION = """
+    SECURITY: compiles the supplied Java source and runs it inside the extension's own JVM with full
+    Utilities/Logging access, once per proxy history item — only use this with a trusted MCP client.
+    Mirrors Burp's Proxy history filter 'Script mode' and the github.com/PortSwigger/bambdas example
+    library: code is the body of
+    'boolean matches(ProxyHttpRequestResponse requestResponse, Utilities utilities, Logging logging)'.
+    Compile errors and exceptions thrown by the code are returned verbatim instead of results. Matching
+    rows are rendered the same as get_proxy_http_history_summary. Prefer that tool's built-in filters and
+    regex when they can express the search; reach for Bambda only for logic they can't, since every item
+    pays for a reflective call.
+
+    Example snippets, one technique each:
+    - Method: return !requestResponse.request().method().equals("OPTIONS");
+    - Status code: return requestResponse.hasResponse() && requestResponse.response().statusCode() == 403;
+    - Status code range + body size: return requestResponse.hasResponse() && requestResponse.response().statusCode() >= 300 && requestResponse.response().statusCode() <= 399 && requestResponse.response().body().length() > 1000;
+    - Response body substring: return requestResponse.hasResponse() && requestResponse.response().bodyToString().contains("You have an error in your SQL syntax");
+    - Cookie value: if (!requestResponse.request().hasParameter("session", HttpParameterType.COOKIE)) return false; return requestResponse.request().parameter("session", HttpParameterType.COOKIE).value().contains("1337");
+    - GraphQL-shaped request: return requestResponse.request().hasParameter("query", HttpParameterType.JSON) || requestResponse.request().hasParameter("query", HttpParameterType.BODY);
+    - Reflected parameter (XSS/SSTI surface): if (!requestResponse.hasResponse()) return false; for (ParsedHttpParameter p : requestResponse.request().parameters()) { if (p.value().length() > 3 && requestResponse.response().contains(p.value(), true)) return true; } return false;
+    - Host substring, avoiding regex escaping headaches: return !requestResponse.httpService().host().contains("internal.example.com");
+    - Using utilities()/logging() (example-library style): logging().logToOutput("checked " + requestResponse.request().url()); return utilities().urlUtils().decode(requestResponse.request().path()).contains("../");
+""".trimIndent()
+
+/**
  * Burp's own filtering runs inside Burp, so the predicates are handed to
  * `Proxy.history(ProxyHistoryFilter)` rather than applied to a fully materialized history.
  *
  * Cheap metadata checks come first so that the regex, which has to pull whole messages, only runs
  * on the items everything else already accepted.
  */
+/**
+ * Parses a status code class like "4xx" (case-insensitive) into the leading digit, or null if
+ * [value] isn't in that shape.
+ */
+private fun parseStatusCodeClass(value: String): Int? {
+    val match = Regex("^([1-5])xx$", RegexOption.IGNORE_CASE).matchEntire(value) ?: return null
+    return match.groupValues[1].toInt()
+}
+
+/** Extension of the last path segment (ignoring query/fragment), lowercased, or null if it has none. */
+private fun extensionOf(path: String?): String? {
+    val lastSegment = path?.substringBefore('?')?.substringBefore('#')?.substringAfterLast('/') ?: return null
+    val dotIndex = lastSegment.lastIndexOf('.')
+    return if (dotIndex in 0 until lastSegment.length - 1) lastSegment.substring(dotIndex + 1).lowercase() else null
+}
+
+private fun parseExtensionList(value: String): Set<String> =
+    value.split(",").map { it.trim().lowercase() }.filterTo(mutableSetOf()) { it.isNotEmpty() }
+
 private fun GetProxyHttpHistorySummary.historyFilters(
     api: MontoyaApi, compiledRegex: Pattern?, searchScope: MessageSelection
-): List<(ProxyHttpRequestResponse) -> Boolean> = buildList {
-    host?.let { value -> add { it.httpService().host().contains(value, ignoreCase = true) } }
-    urlContains?.let { value -> add { it.request()?.path()?.contains(value, ignoreCase = true) == true } }
-    method?.let { value -> add { it.request()?.method().equals(value, ignoreCase = true) } }
-    mimeType?.let { value -> add { it.mimeType().name.equals(value, ignoreCase = true) } }
-    statusCode?.let { value -> add { it.hasResponse() && it.response().statusCode().toInt() == value } }
-    hasResponse?.let { value -> add { it.hasResponse() == value } }
-    fromId?.let { value -> add { it.id() >= value } }
-    toId?.let { value -> add { it.id() <= value } }
-    if (inScopeOnly == true) {
-        add { request -> request.request()?.url()?.let { api.scope().isInScope(it) } == true }
+): List<(ProxyHttpRequestResponse) -> Boolean>? {
+    val statusCodeClassDigit = statusCodeClass?.let { parseStatusCodeClass(it) ?: return null }
+
+    return buildList {
+        host?.let { value -> add { it.httpService().host().contains(value, ignoreCase = true) } }
+        hostExcludes?.let { value -> add { !it.httpService().host().contains(value, ignoreCase = true) } }
+        urlContains?.let { value -> add { it.request()?.path()?.contains(value, ignoreCase = true) == true } }
+        method?.let { value -> add { it.request()?.method().equals(value, ignoreCase = true) } }
+        mimeType?.let { value -> add { it.mimeType().name.equals(value, ignoreCase = true) } }
+        mimeTypeExcludes?.let { value -> add { !it.mimeType().name.equals(value, ignoreCase = true) } }
+        fileExtension?.let { value ->
+            val wanted = parseExtensionList(value)
+            add { extensionOf(it.request()?.path()) in wanted }
+        }
+        fileExtensionExcludes?.let { value ->
+            val excluded = parseExtensionList(value)
+            add { extensionOf(it.request()?.path()) !in excluded }
+        }
+        statusCode?.let { value -> add { it.hasResponse() && it.response().statusCode().toInt() == value } }
+        statusCodeClassDigit?.let { digit -> add { it.hasResponse() && it.response().statusCode().toInt() / 100 == digit } }
+        hasResponse?.let { value -> add { it.hasResponse() == value } }
+        fromId?.let { value -> add { it.id() >= value } }
+        toId?.let { value -> add { it.id() <= value } }
+        if (inScopeOnly == true) {
+            add { request -> request.request()?.url()?.let { api.scope().isInScope(it) } == true }
+        }
+        compiledRegex?.let { pattern -> add { it.regexSearch(pattern, searchScope) != null } }
     }
-    compiledRegex?.let { pattern -> add { it.regexSearch(pattern, searchScope) != null } }
 }
 
 /**
@@ -425,11 +487,14 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
                 "history table: id (the '#' column), host, method, url, params, edited, statusCode and length. " +
                 "Pass a regex to search the whole history: it is matched against the complete raw messages, headers " +
                 "and bodies included, and searchIn ('both', 'request' or 'response') narrows which messages are " +
-                "searched. Matching rows also report matchedIn and the first matching text. " +
-                "Every filter is optional and they combine: host and urlContains (case-insensitive substrings), " +
-                "method, statusCode, mimeType (Burp's type name, e.g. JSON or HTML), hasResponse, inScopeOnly (uses " +
-                "Burp's target scope), and the fromId/toId id range. Narrowing with these makes a regex search much " +
-                "cheaper, since the regex only runs on what they accept. " +
+                "searched; caseSensitive defaults to true, set it false for a case-insensitive regex. Matching rows " +
+                "also report matchedIn and the first matching text. " +
+                "Every filter is optional and they combine: host/hostExcludes and urlContains (case-insensitive " +
+                "substrings), method, statusCode (exact) or statusCodeClass ('2xx'..'5xx'), mimeType/mimeTypeExcludes " +
+                "(Burp's type name, e.g. JSON or HTML), fileExtension/fileExtensionExcludes (comma-separated, e.g. " +
+                "'js,css,png', matched against the last path segment), hasResponse, inScopeOnly (uses Burp's target " +
+                "scope), and the fromId/toId id range. Narrowing with these makes a regex search much cheaper, since " +
+                "the regex only runs on what they accept. " +
                 "Set newestFirst to page back from the most recent request, which is usually what you want. " +
                 "Use this to survey traffic cheaply, then call get_proxy_http_history_item with the ids you care about for the full requests and responses."
     ) {
@@ -438,8 +503,10 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         val searchScope = parseMessageSelection(searchIn)
             ?: return@mcpPaginatedTool paginationMessage("searchIn must be one of $MESSAGE_SELECTION_VALUES")
 
-        val compiledRegex = regex?.let { Pattern.compile(it) }
+        val regexFlags = if (caseSensitive == false) Pattern.CASE_INSENSITIVE else 0
+        val compiledRegex = regex?.let { Pattern.compile(it, regexFlags) }
         val filters = historyFilters(api, compiledRegex, searchScope)
+            ?: return@mcpPaginatedTool paginationMessage("statusCodeClass must be one of '1xx'..'5xx'")
 
         val history = if (filters.isEmpty()) {
             api.proxy().history()
@@ -454,6 +521,22 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
                 item.toSummaryForm().copy(matchedIn = search?.matchedIn, match = search?.match)
             )
         }
+    }
+
+    mcpPaginatedTool<GetProxyHttpHistoryBambda>(BAMBDA_TOOL_DESCRIPTION) {
+        logDataAccess(api, "HTTP history")
+
+        val compiled = BambdaCompiler.compile(code).getOrElse { error ->
+            return@mcpPaginatedTool paginationMessage("Bambda compile error: ${error.message}")
+        }
+
+        val history = try {
+            api.proxy().history { item -> compiled.matches(item, api) }
+        } catch (e: Exception) {
+            return@mcpPaginatedTool paginationMessage("Bambda execution error: ${e.cause?.message ?: e.message}")
+        }
+
+        paginated(history) { item -> Json.encodeToString(item.toSummaryForm()) }
     }
 
     mcpTool<GetProxyHttpHistoryItem>(
@@ -717,15 +800,29 @@ data class GetProxyHttpHistoryRegex(
 data class GetProxyHttpHistorySummary(
     val regex: String? = null,
     val searchIn: String? = null,
+    val caseSensitive: Boolean? = null,
     val host: String? = null,
+    val hostExcludes: String? = null,
     val urlContains: String? = null,
     val method: String? = null,
     val mimeType: String? = null,
+    val mimeTypeExcludes: String? = null,
+    val fileExtension: String? = null,
+    val fileExtensionExcludes: String? = null,
     val statusCode: Int? = null,
+    val statusCodeClass: String? = null,
     val hasResponse: Boolean? = null,
     val inScopeOnly: Boolean? = null,
     val fromId: Int? = null,
     val toId: Int? = null,
+    override val count: Int,
+    override val offset: Int,
+    override val newestFirst: Boolean? = null
+) : Paginated
+
+@Serializable
+data class GetProxyHttpHistoryBambda(
+    val code: String,
     override val count: Int,
     override val offset: Int,
     override val newestFirst: Boolean? = null
