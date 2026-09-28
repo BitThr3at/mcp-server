@@ -673,9 +673,18 @@ class ToolsKtTest {
             mimeType: MimeType = MimeType.HTML,
             requestText: String = "$method $path HTTP/1.1\r\nHost: $host\r\n\r\n",
             responseText: String = "HTTP/1.1 200 OK\r\n\r\nbody",
-            notes: String = ""
+            notes: String = "",
+            requestHeaders: Map<String, String> = emptyMap(),
+            responseHeaders: Map<String, String> = emptyMap()
         ): ProxyHttpRequestResponse {
             val scheme = if (secure) "https" else "http"
+
+            fun headerMocks(headers: Map<String, String>): List<HttpHeader> = headers.map { (name, value) ->
+                mockk<HttpHeader>().also {
+                    every { it.name() } returns name
+                    every { it.value() } returns value
+                }
+            }
 
             val request = mockk<HttpRequest>().also {
                 every { it.hasParameters() } returns hasParams
@@ -684,6 +693,9 @@ class ToolsKtTest {
                 every { it.method() } returns method
                 every { it.path() } returns path
                 every { it.url() } returns "$scheme://$host$path"
+                every { it.hasHeader(any<String>()) } answers { requestHeaders.containsKey(firstArg<String>()) }
+                every { it.headerValue(any<String>()) } answers { requestHeaders[firstArg<String>()] }
+                every { it.headers() } returns headerMocks(requestHeaders)
             }
 
             val response = statusCode?.let { code ->
@@ -694,6 +706,9 @@ class ToolsKtTest {
                     }
                     every { it.toString() } returns responseText
                     every { it.bodyOffset() } returns bodyOffsetOf(responseText)
+                    every { it.hasHeader(any<String>()) } answers { responseHeaders.containsKey(firstArg<String>()) }
+                    every { it.headerValue(any<String>()) } answers { responseHeaders[firstArg<String>()] }
+                    every { it.headers() } returns headerMocks(responseHeaders)
                 }
             }
 
@@ -896,6 +911,75 @@ class ToolsKtTest {
             }
 
             verify(exactly = 0) { proxy.history() }
+        }
+
+        @Test
+        fun `summary should filter on header presence and value in the requested scope`() {
+            filterableHistory(
+                listOf(
+                    historyItem(1, requestHeaders = mapOf("Authorization" to "Bearer abc")),
+                    historyItem(2, requestHeaders = emptyMap()),
+                    historyItem(3, responseHeaders = mapOf("Set-Cookie" to "session=1337; Path=/"))
+                )
+            )
+
+            runBlocking {
+                val byPresence = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "headerName" to "Authorization",
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+                delay(100)
+                assertEquals(listOf(1), summaryIds(byPresence.expectTextContent()))
+
+                val byValueInResponse = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "headerName" to "Set-Cookie",
+                        "headerValueContains" to "1337",
+                        "headerIn" to "response",
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+                delay(100)
+                assertEquals(listOf(3), summaryIds(byValueInResponse.expectTextContent()))
+
+                val missingInRequestOnly = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "headerName" to "Set-Cookie",
+                        "headerIn" to "request",
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+                delay(100)
+                assertEquals(emptyList<Int>(), summaryIds(missingInRequestOnly.expectTextContent()))
+            }
+        }
+
+        @Test
+        fun `summary should search every header for a substring when headerName is omitted`() {
+            filterableHistory(
+                listOf(
+                    historyItem(1, responseHeaders = mapOf("Server" to "nginx/4.0.1")),
+                    historyItem(2, requestHeaders = mapOf("X-Powered-By" to "PHP/4.0.1")),
+                    historyItem(3, responseHeaders = mapOf("Server" to "nginx/1.25.0"))
+                )
+            )
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history_summary", mapOf(
+                        "headerValueContains" to "4.0.1",
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+                delay(100)
+                assertEquals(listOf(1, 2), summaryIds(result.expectTextContent()))
+            }
         }
 
         @Test

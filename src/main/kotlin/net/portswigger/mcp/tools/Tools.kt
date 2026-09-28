@@ -131,8 +131,41 @@ private fun extensionOf(path: String?): String? {
 private fun parseExtensionList(value: String): Set<String> =
     value.split(",").map { it.trim().lowercase() }.filterTo(mutableSetOf()) { it.isNotEmpty() }
 
+/**
+ * True if [name] is present in the messages [scope] selects (request and/or response), and, when
+ * [valueContains] is given, its value also contains that substring, case-insensitively.
+ */
+private fun ProxyHttpRequestResponse.headerMatches(
+    name: String, valueContains: String?, scope: MessageSelection
+): Boolean {
+    fun matchesIn(message: burp.api.montoya.http.message.HttpMessage?): Boolean {
+        if (message == null || !message.hasHeader(name)) return false
+        return valueContains == null || message.headerValue(name)?.contains(valueContains, ignoreCase = true) == true
+    }
+
+    val inRequest = scope.request && matchesIn(request())
+    val inResponse = scope.response && hasResponse() && matchesIn(response())
+    return inRequest || inResponse
+}
+
+/**
+ * True if any header's name or value in the messages [scope] selects contains [substring],
+ * case-insensitively — for finding a value (a version string, a token) without knowing which header
+ * it lives in.
+ */
+private fun ProxyHttpRequestResponse.anyHeaderContains(substring: String, scope: MessageSelection): Boolean {
+    fun matchesIn(message: burp.api.montoya.http.message.HttpMessage?): Boolean =
+        message?.headers()?.any {
+            it.name().contains(substring, ignoreCase = true) || it.value().contains(substring, ignoreCase = true)
+        } == true
+
+    val inRequest = scope.request && matchesIn(request())
+    val inResponse = scope.response && hasResponse() && matchesIn(response())
+    return inRequest || inResponse
+}
+
 private fun GetProxyHttpHistorySummary.historyFilters(
-    api: MontoyaApi, compiledRegex: Pattern?, searchScope: MessageSelection
+    api: MontoyaApi, compiledRegex: Pattern?, searchScope: MessageSelection, headerScope: MessageSelection
 ): List<(ProxyHttpRequestResponse) -> Boolean>? {
     val statusCodeClassDigit = statusCodeClass?.let { parseStatusCodeClass(it) ?: return null }
 
@@ -142,6 +175,10 @@ private fun GetProxyHttpHistorySummary.historyFilters(
         urlContains?.let { value -> add { it.request()?.path()?.contains(value, ignoreCase = true) == true } }
         method?.let { value -> add { it.request()?.method().equals(value, ignoreCase = true) } }
         mimeType?.let { value -> add { it.mimeType().name.equals(value, ignoreCase = true) } }
+        when {
+            headerName != null -> add { it.headerMatches(headerName, headerValueContains, headerScope) }
+            headerValueContains != null -> add { it.anyHeaderContains(headerValueContains, headerScope) }
+        }
         mimeTypeExcludes?.let { value -> add { !it.mimeType().name.equals(value, ignoreCase = true) } }
         fileExtension?.let { value ->
             val wanted = parseExtensionList(value)
@@ -492,9 +529,15 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
                 "Every filter is optional and they combine: host/hostExcludes and urlContains (case-insensitive " +
                 "substrings), method, statusCode (exact) or statusCodeClass ('2xx'..'5xx'), mimeType/mimeTypeExcludes " +
                 "(Burp's type name, e.g. JSON or HTML), fileExtension/fileExtensionExcludes (comma-separated, e.g. " +
-                "'js,css,png', matched against the last path segment), hasResponse, inScopeOnly (uses Burp's target " +
-                "scope), and the fromId/toId id range. Narrowing with these makes a regex search much cheaper, since " +
-                "the regex only runs on what they accept. " +
+                "'js,css,png', matched against the last path segment), headerName with optional headerValueContains " +
+                "(e.g. headerName='Authorization' to find authenticated requests, or headerName='Set-Cookie', " +
+                "headerValueContains='session' to find a specific cookie being set), or headerValueContains alone " +
+                "(no headerName) to search every header's name and value for a substring without knowing which " +
+                "header it's in, e.g. headerValueContains='4.0.1' to spot a version string wherever it's reported " +
+                "(Server, X-Powered-By, etc); headerIn scopes any of these like searchIn does for regex. " +
+                "hasResponse, inScopeOnly (uses Burp's target scope), and the fromId/toId " +
+                "id range. Narrowing with these makes a regex search much cheaper, since the regex only runs on " +
+                "what they accept. " +
                 "Set newestFirst to page back from the most recent request, which is usually what you want. " +
                 "Use this to survey traffic cheaply, then call get_proxy_http_history_item with the ids you care about for the full requests and responses."
     ) {
@@ -502,10 +545,12 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
 
         val searchScope = parseMessageSelection(searchIn)
             ?: return@mcpPaginatedTool paginationMessage("searchIn must be one of $MESSAGE_SELECTION_VALUES")
+        val headerScope = parseMessageSelection(headerIn)
+            ?: return@mcpPaginatedTool paginationMessage("headerIn must be one of $MESSAGE_SELECTION_VALUES")
 
         val regexFlags = if (caseSensitive == false) Pattern.CASE_INSENSITIVE else 0
         val compiledRegex = regex?.let { Pattern.compile(it, regexFlags) }
-        val filters = historyFilters(api, compiledRegex, searchScope)
+        val filters = historyFilters(api, compiledRegex, searchScope, headerScope)
             ?: return@mcpPaginatedTool paginationMessage("statusCodeClass must be one of '1xx'..'5xx'")
 
         val history = if (filters.isEmpty()) {
@@ -809,6 +854,9 @@ data class GetProxyHttpHistorySummary(
     val mimeTypeExcludes: String? = null,
     val fileExtension: String? = null,
     val fileExtensionExcludes: String? = null,
+    val headerName: String? = null,
+    val headerValueContains: String? = null,
+    val headerIn: String? = null,
     val statusCode: Int? = null,
     val statusCodeClass: String? = null,
     val hasResponse: Boolean? = null,
